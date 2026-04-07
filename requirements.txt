@@ -2,3 +2,8 @@ python-mpv>=1.0.1
 httpx>=0.24.1
 PyYAML>=6.0
 aiofiles>=23.1.0
+
+# NDI support (optional — player works without these)
+ndi-python>=5.1.0
+numpy>=1.24.0
+opencv-python-headless>=4.8.0

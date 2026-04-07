@@ -142,23 +142,27 @@ step "Installing system dependencies"
 
 install_deps_debian() {
     apt-get update -qq
-    apt-get install -y -qq python3 python3-pip python3-venv mpv libmpv-dev
+    apt-get install -y -qq python3 python3-pip python3-venv mpv libmpv-dev \
+        avahi-daemon libavahi-client-dev
 }
 
 install_deps_fedora() {
     if command -v dnf &>/dev/null; then
-        dnf install -y python3 python3-pip python3-virtualenv mpv mpv-libs-devel
+        dnf install -y python3 python3-pip python3-virtualenv mpv mpv-libs-devel \
+            avahi avahi-devel
     else
-        yum install -y python3 python3-pip python3-virtualenv mpv mpv-libs-devel
+        yum install -y python3 python3-pip python3-virtualenv mpv mpv-libs-devel \
+            avahi avahi-devel
     fi
 }
 
 install_deps_arch() {
-    pacman -Syu --noconfirm --needed python python-pip mpv
+    pacman -Syu --noconfirm --needed python python-pip mpv avahi
 }
 
 install_deps_suse() {
-    zypper install -y python3 python3-pip python3-virtualenv mpv libmpv-devel
+    zypper install -y python3 python3-pip python3-virtualenv mpv libmpv-devel \
+        avahi avahi-utils
 }
 
 case "$DISTRO" in

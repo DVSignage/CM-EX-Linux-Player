@@ -34,6 +34,22 @@ try:
 except ImportError:
     _mpv_module = None
 
+# NDI support (optional — gracefully disabled if not installed)
+try:
+    from ndi.engine import (
+        is_available as ndi_available,
+        find_sources as ndi_find_sources,
+        NDIReceiver,
+        NDISender,
+        cleanup as ndi_cleanup,
+    )
+except ImportError:
+    ndi_available = lambda: False
+    ndi_find_sources = lambda **kw: []
+    NDIReceiver = None
+    NDISender = None
+    ndi_cleanup = lambda: None
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -381,6 +397,21 @@ class Player:
 
         # asyncio event loop (set in run())
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # NDI state
+        self._ndi_receiver: Optional[object] = None
+        self._ndi_sender: Optional[object] = None
+        self._ndi_active_key: Optional[str] = None  # dedup key for wall commands
+
+        if NDIReceiver is not None:
+            self._ndi_receiver = NDIReceiver()
+        if NDISender is not None:
+            self._ndi_sender = NDISender()
+
+        if ndi_available():
+            log.info("[NDI] NDI support enabled")
+        else:
+            log.info("[NDI] NDI support not available — running without NDI")
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -820,12 +851,22 @@ class Player:
         if not self._player_id:
             return
         try:
+            heartbeat_payload = {
+                "status": "online",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "ndi_available": ndi_available(),
+            }
+            # Include NDI broadcast info if active
+            if self._ndi_sender and self._ndi_sender.active:
+                heartbeat_payload["ndi_broadcast_active"] = True
+                heartbeat_payload["ndi_broadcast_name"] = self._ndi_sender.source_name
+            if self._ndi_receiver and self._ndi_receiver.active:
+                heartbeat_payload["ndi_receive_active"] = True
+                heartbeat_payload["ndi_receive_source"] = self._ndi_receiver.source_name
+
             r = await self._http_client().post(
                 f"{self.cms_url}/api/v1/players/{self._player_id}/heartbeat",
-                json={
-                    "status": "online",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
+                json=heartbeat_payload,
             )
 
             if r.status_code == 404:
@@ -896,6 +937,61 @@ class Player:
         elif cmd == "restart":
             self._cancel_duration_timer()
             asyncio.create_task(self._play_index(self._current_index))
+
+        # -- NDI commands (mirror Windows player) --
+
+        elif cmd == "show_ndi":
+            source_name = data.get("source_name") or data.get("ndi_source_name")
+            if source_name and self._ndi_receiver:
+                log.info(f"[NDI] show_ndi: {source_name}")
+                self._cancel_duration_timer()
+                self.mpv.cmd_stop()  # stop regular playback
+                self._ndi_receiver.start(source_name)
+            else:
+                log.warning("[NDI] show_ndi but source_name is empty or NDI unavailable")
+
+        elif cmd == "hide_ndi":
+            source_name = data.get("source_name") or data.get("ndi_source_name")
+            if self._ndi_receiver:
+                log.info(f"[NDI] hide_ndi: {source_name}")
+                self._ndi_receiver.stop()
+                self._ndi_active_key = None
+                # Resume regular playback if we have a playlist
+                if self._playlist_items:
+                    asyncio.create_task(self._play_index(self._current_index))
+
+        elif cmd == "show_ndi_wall":
+            source_name = data.get("source_name") or data.get("ndi_source_name")
+            crop = data.get("wall_crop")
+            if source_name and self._ndi_receiver:
+                wall_key = f"ndi_{source_name}_{json.dumps(crop)}"
+                if wall_key == self._ndi_active_key:
+                    log.info("[NDI WALL] Same NDI wall already active — skip")
+                else:
+                    self._ndi_active_key = wall_key
+                    log.info(f"[NDI WALL] Starting: {source_name} crop={crop}")
+                    self._cancel_duration_timer()
+                    self.mpv.cmd_stop()
+                    ndi_crop = None
+                    if crop:
+                        ndi_crop = {
+                            "x": crop.get("x", 0),
+                            "y": crop.get("y", 0),
+                            "w": crop.get("w", 1),
+                            "h": crop.get("h", 1),
+                        }
+                    self._ndi_receiver.start(source_name, crop=ndi_crop)
+
+        elif cmd == "start_ndi_broadcast":
+            if self._ndi_sender:
+                name = data.get("ndi_broadcast_name") or f"{self._player_id}-Output"
+                log.info(f"[NDI SEND] Starting broadcast: {name}")
+                self._ndi_sender.start(name)
+
+        elif cmd == "stop_ndi_broadcast":
+            if self._ndi_sender:
+                log.info("[NDI SEND] Stopping broadcast")
+                self._ndi_sender.stop()
 
         else:
             log.debug(f"Unknown command: {cmd}")
@@ -1018,6 +1114,12 @@ class Player:
         self._cancel_duration_timer()
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
+        # Stop NDI
+        if self._ndi_receiver:
+            self._ndi_receiver.stop()
+        if self._ndi_sender:
+            self._ndi_sender.stop()
+        ndi_cleanup()
         self.mpv.terminate()
         if self._http and not self._http.is_closed:
             asyncio.create_task(self._http.aclose())
