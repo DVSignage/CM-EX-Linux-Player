@@ -1,0 +1,50 @@
+{
+  "id": "example-playlist-001",
+  "name": "Example Playlist",
+  "description": "An example playlist for testing",
+  "loop": true,
+  "items": [
+    {
+      "id": "item-1",
+      "content_id": "content-1",
+      "duration": 0,
+      "transition": "cut",
+      "order": 0,
+      "content": {
+        "id": "content-1",
+        "filename": "video1.mp4",
+        "path": "/path/to/video1.mp4",
+        "type": "video",
+        "mime_type": "video/mp4"
+      }
+    },
+    {
+      "id": "item-2",
+      "content_id": "content-2",
+      "duration": 10,
+      "transition": "cut",
+      "order": 1,
+      "content": {
+        "id": "content-2",
+        "filename": "image1.jpg",
+        "path": "/path/to/image1.jpg",
+        "type": "image",
+        "mime_type": "image/jpeg"
+      }
+    },
+    {
+      "id": "item-3",
+      "content_id": "content-3",
+      "duration": 0,
+      "transition": "cut",
+      "order": 2,
+      "content": {
+        "id": "content-3",
+        "filename": "video2.mp4",
+        "path": "/path/to/video2.mp4",
+        "type": "video",
+        "mime_type": "video/mp4"
+      }
+    }
+  ]
+}

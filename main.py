@@ -1,0 +1,1052 @@
+#!/usr/bin/env python3
+"""
+Digital Signage CMS - Linux Media Player
+
+Single-file orchestrator that mirrors the Windows player (main.js) behaviour:
+  - Enrollment flow with OSD code display via mpv
+  - Boot-from-cache for instant playback
+  - Content download from CMS API (/api/v1/content/{id}/stream)
+  - Progressive playback (starts on first downloaded file)
+  - Per-item durations (0 = play-to-end for video, >0 = timer)
+  - 500 ms heartbeat with full command dispatch
+  - 50 GB cache limit
+  - state.json for player_id persistence
+  - Graceful shutdown on SIGINT / SIGTERM
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import signal
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import httpx
+import yaml
+
+try:
+    import mpv as _mpv_module
+except ImportError:
+    _mpv_module = None
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("player")
+
+# ---------------------------------------------------------------------------
+# Paths / constants
+# ---------------------------------------------------------------------------
+CONFIG_DIR = Path.home() / ".config" / "signage-player"
+STATE_PATH = CONFIG_DIR / "state.json"
+OFFLINE_PLAYLIST_PATH = CONFIG_DIR / "offline_playlist.json"
+CACHE_DIR = CONFIG_DIR / "cache"
+CACHE_LIMIT_BYTES = 50 * 1024 * 1024 * 1024  # 50 GB
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg"}
+DEFAULT_IMAGE_DURATION = 10  # seconds when duration == 0 for an image
+
+# ---------------------------------------------------------------------------
+# Config loading (config.yaml)
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
+    """Load config.yaml from standard search locations."""
+    search = [
+        Path("config.yaml"),
+        Path("/etc/signage-player/config.yaml"),
+        Path.home() / ".config" / "signage-player" / "config.yaml",
+    ]
+    for p in search:
+        if p.exists():
+            with open(p) as f:
+                data = yaml.safe_load(f) or {}
+            log.info(f"Loaded config from {p}")
+            return data
+    log.warning("No config.yaml found — using defaults.")
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# State persistence  (~/.config/signage-player/state.json)
+# ---------------------------------------------------------------------------
+
+def load_state() -> dict:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if STATE_PATH.exists():
+        try:
+            return json.loads(STATE_PATH.read_text())
+        except Exception as e:
+            log.error(f"Failed to load state: {e}")
+    return {}
+
+
+def save_state(state: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def clear_state() -> None:
+    if STATE_PATH.exists():
+        STATE_PATH.unlink()
+
+
+# ---------------------------------------------------------------------------
+# MPV wrapper
+# ---------------------------------------------------------------------------
+
+class MpvPlayer:
+    """
+    Thin wrapper around python-mpv that exposes the operations needed by
+    the player orchestrator.
+
+    Thread-safety note: mpv callbacks fire on mpv's internal thread.  We
+    schedule coroutines back on the asyncio event loop via
+    loop.call_soon_threadsafe() so all state mutations happen on the loop.
+    """
+
+    def __init__(self, display: str = ":0", audio_output: str = "auto"):
+        if _mpv_module is None:
+            raise RuntimeError(
+                "python-mpv is not installed.  Run: pip install python-mpv"
+            )
+        self.display = display
+        self.audio_output = audio_output
+        self._mpv: Optional[_mpv_module.MPV] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._eof_callback = None   # async callable() — called when a file ends
+
+    def initialise(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Create the mpv instance.  Must be called from the async main."""
+        self._loop = loop
+        # Guard flag: True while we're deliberately loading a new file so that
+        # the end-file callback for the interrupted previous file is ignored.
+        self._deliberate_load = False
+
+        kwargs = dict(
+            input_default_bindings=False,
+            input_vo_keyboard=False,
+            osc=False,
+            ytdl=False,
+            idle=True,              # keep window open even with nothing playing
+            keep_open="always",     # freeze last frame on EOF instead of going black
+            force_window="yes",
+            hwdec="auto",
+            fs=True,                # fullscreen
+            really_quiet=True,
+            osd_font_size=48,
+            osd_duration=10000,
+            # Prevent display / screensaver blanking during playback
+            stop_screensaver="yes",
+            # Pre-buffer next item to reduce decode gap between files
+            prefetch_playlist="yes",
+            demuxer_readahead_secs=5,
+        )
+
+        # audio device
+        if self.audio_output and self.audio_output != "auto":
+            kwargs["audio_device"] = self.audio_output
+
+        # Try GPU VO first, then fall back to safer alternatives
+        for vo_driver in ["gpu", "x11", "drm", ""]:
+            try:
+                if vo_driver:
+                    kwargs["vo"] = vo_driver
+                self._mpv = _mpv_module.MPV(**kwargs)
+                log.info(f"mpv initialised (vo={vo_driver or 'auto'}, fullscreen)")
+                break
+            except Exception as e:
+                log.warning(f"mpv vo={vo_driver or 'auto'} failed: {e}")
+                kwargs.pop("vo", None)
+        else:
+            raise RuntimeError("Could not initialise mpv with any video output driver")
+
+        @self._mpv.event_callback("file-loaded")
+        def _on_file_loaded(event):
+            # New file has started — any subsequent end-file is a genuine EOF
+            self._deliberate_load = False
+
+        @self._mpv.event_callback("end-file")
+        def _on_end_file(event):
+            # If we triggered this end-file by calling play() on a new file,
+            # ignore it — the deliberate_load flag tells us it was intentional.
+            if self._deliberate_load:
+                return
+
+            # Extra safety: read the reason regardless of event format.
+            # python-mpv >= 1.0 passes event as a dict; older versions pass an
+            # MpvEvent struct (not a dict), which was the cause of the original
+            # bug where reason was always None and ALL end-file events triggered
+            # an advance, even intentional stop events.
+            reason = None
+            try:
+                if isinstance(event, dict):
+                    reason = event.get("reason")
+                elif hasattr(event, "reason"):
+                    reason = event.reason
+                elif hasattr(event, "__getitem__"):
+                    reason = event["reason"]
+            except Exception:
+                pass
+
+            # Normalise enum values (python-mpv may return an EndOfFileReason enum)
+            if hasattr(reason, "value"):
+                reason = reason.value
+
+            # Only advance on natural end-of-file.
+            # stop / quit / error / redirect must NOT trigger an advance.
+            if str(reason).lower() in ("eof", "0") or reason == 0:
+                if self._eof_callback and self._loop:
+                    self._loop.call_soon_threadsafe(
+                        self._loop.create_task, self._eof_callback()
+                    )
+
+    def set_eof_callback(self, coro_fn) -> None:
+        """Register an async callable to invoke when a file finishes playing."""
+        self._eof_callback = coro_fn
+
+    def play_file(self, path: str, loop: bool = False) -> None:
+        """Load and play a local file path (or URL).
+
+        Sets _deliberate_load=True before calling play() so the end-file
+        callback for any currently-playing file is ignored (it was stopped
+        intentionally, not via natural EOF).
+        """
+        if self._mpv:
+            self._deliberate_load = True
+            try:
+                self._mpv.loop_file = "inf" if loop else "no"
+            except Exception:
+                pass
+            self._mpv.play(path)
+
+    def show_osd(self, text: str, duration_ms: int = 10_000) -> None:
+        """Display OSD text overlay.
+
+        Tries multiple methods in order of reliability:
+        1. osd-overlay (mpv >= 0.31, persistent, supports ASS styling)
+        2. show-text command (works in most versions)
+        3. osd_msg1 property (last resort)
+        """
+        if not self._mpv:
+            return
+        # Method 1: osd-overlay (most reliable for persistent text)
+        try:
+            self._mpv.command(
+                "osd-overlay", 1, "ass-events",
+                # ASS-formatted text: centred, white on semi-transparent black box
+                r"{\an5\fs48\bord3\b1}" + text.replace("\n", r"\N")
+            )
+            return
+        except Exception:
+            pass
+        # Method 2: show-text
+        try:
+            self._mpv.command("show-text", text, str(duration_ms))
+            return
+        except Exception:
+            pass
+        # Method 3: property
+        try:
+            self._mpv.osd_msg1 = text
+        except Exception:
+            pass
+
+    def clear_osd(self) -> None:
+        """Remove any persistent OSD overlay."""
+        if not self._mpv:
+            return
+        try:
+            self._mpv.command("osd-overlay", 1, "none", "")
+        except Exception:
+            pass
+        try:
+            self._mpv.osd_msg1 = ""
+        except Exception:
+            pass
+
+    def cmd_play(self) -> None:
+        if self._mpv:
+            self._mpv.pause = False
+
+    def cmd_pause(self) -> None:
+        if self._mpv:
+            self._mpv.pause = True
+
+    def cmd_stop(self) -> None:
+        if self._mpv:
+            try:
+                self._mpv.command("stop")
+            except Exception:
+                pass
+
+    def cmd_seek_start(self) -> None:
+        """Seek to the beginning of the current file (restart)."""
+        if self._mpv:
+            try:
+                self._mpv.command("seek", "0", "absolute")
+            except Exception:
+                pass
+
+    def terminate(self) -> None:
+        if self._mpv:
+            try:
+                self._mpv.terminate()
+            except Exception:
+                pass
+            self._mpv = None
+
+
+# ---------------------------------------------------------------------------
+# Helper — is a filename an image?
+# ---------------------------------------------------------------------------
+
+def _is_image(filename: str) -> bool:
+    return Path(filename).suffix.lower() in IMAGE_EXTENSIONS
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+def _cache_size_bytes() -> int:
+    total = 0
+    try:
+        for f in CACHE_DIR.iterdir():
+            if f.is_file():
+                try:
+                    total += f.stat().st_size
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return total
+
+
+# ---------------------------------------------------------------------------
+# Main orchestrator
+# ---------------------------------------------------------------------------
+
+class Player:
+    """
+    Full Linux player that mirrors windows player/main.js behaviour.
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.cms_url: str = cfg.get("cms_url", "").rstrip("/")
+        self.state: dict = load_state()
+
+        # Ensure cms_url is stored / updated in state if config provides it
+        if self.cms_url:
+            self.state["cms_url"] = self.cms_url
+            save_state(self.state)
+
+        # Playback settings from config
+        pb = cfg.get("playback", {})
+        self.display: str = pb.get("display", ":0")
+        self.audio_output: str = pb.get("audio_output", "auto")
+
+        # mpv engine
+        self.mpv = MpvPlayer(display=self.display, audio_output=self.audio_output)
+
+        # Deduplication / boot globals  (mirror JS globals)
+        self.last_playlist_hash: Optional[str] = None
+        self.last_content_id: Optional[str] = None
+        self.boot_cache_loaded: bool = False
+
+        # Current playlist state
+        self._playlist_items: list = []   # list of {path, duration, filename}
+        self._current_index: int = -1
+        self._duration_timer: Optional[asyncio.Task] = None
+
+        # Control flags
+        self._running = True
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._enrollment_task: Optional[asyncio.Task] = None
+
+        # httpx client (shared)
+        self._http: Optional[httpx.AsyncClient] = None
+
+        # asyncio event loop (set in run())
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    # ------------------------------------------------------------------
+    # HTTP helpers
+    # ------------------------------------------------------------------
+
+    def _http_client(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(timeout=30)
+        return self._http
+
+    @property
+    def _player_id(self) -> Optional[str]:
+        return self.state.get("player_id")
+
+    # ------------------------------------------------------------------
+    # Enrollment
+    # ------------------------------------------------------------------
+
+    def _ensure_black_screen(self) -> None:
+        """Play a tiny black PNG so mpv has a visible window for OSD text.
+
+        Without content loaded, some mpv VO drivers won't render OSD at all.
+        This creates a 1x1 black PNG in the cache dir and plays it paused.
+        """
+        black_path = CACHE_DIR / "_black.png"
+        if not black_path.exists():
+            try:
+                # Minimal valid 1x1 black PNG (67 bytes)
+                import struct, zlib
+                def _png_chunk(chunk_type, data):
+                    c = chunk_type + data
+                    return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+                sig = b"\x89PNG\r\n\x1a\n"
+                ihdr = _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+                raw = zlib.compress(b"\x00\x00\x00\x00")
+                idat = _png_chunk(b"IDAT", raw)
+                iend = _png_chunk(b"IEND", b"")
+                black_path.write_bytes(sig + ihdr + idat + iend)
+            except Exception as e:
+                log.warning(f"Could not create black PNG: {e}")
+                return
+        log.info("Loading black screen for OSD overlay...")
+        self.mpv.play_file(str(black_path))
+        # Pause immediately so it stays on screen as a static black frame
+        try:
+            self.mpv._mpv.pause = True
+        except Exception:
+            pass
+
+    async def _request_enrollment(self) -> None:
+        """POST /enroll/request → display code → poll for approval."""
+        # Ensure mpv window is visible with a black background
+        self._ensure_black_screen()
+        await asyncio.sleep(0.5)  # give mpv a moment to open the window
+
+        while self._running:
+            try:
+                log.info("Requesting enrollment code from CMS...")
+                r = await self._http_client().post(
+                    f"{self.cms_url}/api/v1/players/enroll/request"
+                )
+                r.raise_for_status()
+                code = r.json()["code"]
+                log.info(f"Enrollment code: {code}")
+                self._show_enrollment_osd(code)
+                await self._poll_enrollment(code)
+                return  # approved — done
+            except Exception as e:
+                log.error(f"Enrollment request failed: {e}  — retrying in 10s")
+                await asyncio.sleep(10)
+
+    def _show_enrollment_osd(self, code: str) -> None:
+        """Show enrollment code prominently via mpv OSD."""
+        msg = (
+            f"ENROLLMENT CODE\n\n"
+            f"  {code}  \n\n"
+            f"Enter this code in the CMS portal to approve this player."
+        )
+        self.mpv.show_osd(msg, duration_ms=9_000)
+
+    async def _poll_enrollment(self, code: str) -> None:
+        """Poll /enroll/{code}/status every 5 s until approved/expired."""
+        url = f"{self.cms_url}/api/v1/players/enroll/{code}/status"
+        while self._running:
+            # Keep OSD visible while we wait
+            self._show_enrollment_osd(code)
+            await asyncio.sleep(5)
+            try:
+                r = await self._http_client().get(url)
+                if r.status_code == 404:
+                    # Code unknown — get a new one
+                    log.warning("Enrollment code not found — requesting new code")
+                    return  # outer loop will re-request
+                r.raise_for_status()
+                data = r.json()
+                status = data.get("status", "")
+                if status == "approved" and data.get("player_id"):
+                    log.info(f"Approved!  player_id={data['player_id']}")
+                    self.state["player_id"] = data["player_id"]
+                    save_state(self.state)
+                    self.mpv.clear_osd()  # clear enrollment overlay
+                    await self._start_player_routines()
+                    return
+                elif status in ("expired", "rejected"):
+                    log.warning(f"Enrollment {status} — requesting new code")
+                    return  # outer loop re-requests
+                # else still pending — continue polling
+            except Exception as e:
+                log.error(f"Enrollment poll error: {e}")
+                # Don't exit — keep showing code and retrying
+
+    # ------------------------------------------------------------------
+    # Player routines (post-enrollment)
+    # ------------------------------------------------------------------
+
+    async def _start_player_routines(self) -> None:
+        """
+        Mirror of startPlayerRoutines() in main.js:
+        1. Boot from offline_playlist.json instantly if available
+        2. Fetch latest playlist from CMS in background
+        3. Start 500 ms heartbeat loop
+        """
+        log.info("Starting player routines...")
+
+        # 1. Boot from cache
+        self.boot_cache_loaded = False
+        if OFFLINE_PLAYLIST_PATH.exists():
+            log.info("[BOOT] Loading cached playlist for instant playback...")
+            try:
+                offline_data = json.loads(OFFLINE_PLAYLIST_PATH.read_text())
+                asyncio.create_task(self._process_and_download_playlist(offline_data))
+                self.boot_cache_loaded = True
+            except Exception as e:
+                log.error(f"[BOOT] Failed to load cached playlist: {e}")
+
+        # 2. Fetch latest in background
+        asyncio.create_task(self._fetch_playlist())
+
+        # 3. Heartbeat
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        # Send initial heartbeat immediately
+        asyncio.create_task(self._send_heartbeat())
+
+    # ------------------------------------------------------------------
+    # Fetch playlist
+    # ------------------------------------------------------------------
+
+    async def _fetch_playlist(self) -> None:
+        """
+        GET /players/{id}/assigned-playlist and process it.
+        NOTE: must NOT set last_playlist_hash — only the heartbeat handler does.
+        """
+        try:
+            log.info("Fetching assigned playlist from CMS...")
+            r = await self._http_client().get(
+                f"{self.cms_url}/api/v1/players/{self._player_id}/assigned-playlist"
+            )
+            r.raise_for_status()
+            playlist_data = r.json()
+            log.info("Playlist retrieved — processing downloads...")
+            await self._process_and_download_playlist(playlist_data)
+        except Exception as e:
+            log.error(f"Failed to fetch playlist: {e}")
+            if not self.boot_cache_loaded and OFFLINE_PLAYLIST_PATH.exists():
+                log.info("[OFFLINE] Using cached playlist.")
+                try:
+                    offline_data = json.loads(OFFLINE_PLAYLIST_PATH.read_text())
+                    await self._process_and_download_playlist(offline_data)
+                except Exception as e2:
+                    log.error(f"Failed to parse offline playlist: {e2}")
+
+    # ------------------------------------------------------------------
+    # Load single content item (load_content command)
+    # ------------------------------------------------------------------
+
+    async def _load_single_content(self, content_id: str) -> None:
+        """Fetch metadata for a single content item and play it."""
+        try:
+            r = await self._http_client().get(
+                f"{self.cms_url}/api/v1/content/{content_id}"
+            )
+            r.raise_for_status()
+            meta = r.json()
+            filename = meta.get("filename") or f"{content_id}.mp4"
+            mock_playlist = {
+                "items": [{
+                    "content_id": content_id,
+                    "content": {"filename": filename},
+                    "duration": 0,
+                }]
+            }
+        except Exception as e:
+            log.warning(f"[CONTENT] Metadata fetch failed for {content_id}: {e}")
+            mock_playlist = {
+                "items": [{"content_id": content_id, "duration": 0}]
+            }
+        await self._process_and_download_playlist(mock_playlist)
+
+    # ------------------------------------------------------------------
+    # Process and download playlist  (core logic)
+    # ------------------------------------------------------------------
+
+    async def _process_and_download_playlist(self, playlist_data: dict) -> None:
+        """
+        Mirror of processAndDownloadPlaylist() in main.js.
+
+        1. Save offline_playlist.json immediately.
+        2. Build local path list.
+        3. Check 50 GB cache limit.
+        4. Download missing files sequentially; kick off playback after first file ready.
+        5. If all cached: start playback immediately.
+        6. LRU garbage-collect old files.
+        """
+        items = playlist_data.get("items") or []
+        if not items:
+            log.info("No items in playlist.")
+            return
+
+        # Save for offline boot
+        try:
+            OFFLINE_PLAYLIST_PATH.write_text(json.dumps(playlist_data))
+        except Exception as e:
+            log.error(f"Failed to save offline playlist: {e}")
+
+        # Build per-item records
+        to_play: list = []       # final ordered list of {path, duration, filename}
+        to_download: list = []   # {remote_url, local_path, filename, index}
+
+        for item in items:
+            content_id = item.get("content_id")
+            if not content_id:
+                continue
+
+            remote_url = f"{self.cms_url}/api/v1/content/{content_id}/stream"
+            duration = item.get("duration", 0) or 0
+
+            # Determine filename / extension
+            filename = None
+            if item.get("content") and item["content"].get("filename"):
+                filename = item["content"]["filename"]
+            if not filename:
+                filename = f"{content_id}.mp4"
+
+            local_path = CACHE_DIR / filename
+
+            to_play.append({
+                "path": local_path,
+                "duration": duration,
+                "filename": filename,
+            })
+
+            if not local_path.exists():
+                to_download.append({
+                    "remote_url": remote_url,
+                    "local_path": local_path,
+                    "filename": filename,
+                    "index": len(to_play) - 1,
+                })
+
+        # 50 GB cache limit check
+        if to_download:
+            cache_bytes = _cache_size_bytes()
+            if cache_bytes >= CACHE_LIMIT_BYTES:
+                log.error(
+                    "Cache exceeds 50 GB limit — refusing new downloads."
+                )
+                return
+
+        if not to_download:
+            # All cached — start immediately
+            log.info("All files cached — starting playback immediately.")
+            await self._load_playlist(to_play)
+            self._gc_cache(playlist_data)
+            return
+
+        # Progressive playback: download sequentially, start on first ready
+        log.info(
+            f"Need to download {len(to_download)} file(s).  "
+            f"Will start playback after first file is ready."
+        )
+        initial_triggered = False
+
+        for i, dl in enumerate(to_download):
+            log.info(
+                f"[DOWNLOADING {i+1}/{len(to_download)}] "
+                f"{dl['filename']}  from  {dl['remote_url']}"
+            )
+            success = await self._download_file(
+                dl["remote_url"], dl["local_path"]
+            )
+            if not success:
+                log.error(f"Download failed for {dl['filename']} — skipping")
+                await asyncio.sleep(2)
+
+            # After first successful download, kick off playback with whatever
+            # is available so far (only cached files will be included)
+            if not initial_triggered and to_play[0]["path"].exists():
+                log.info("First file ready — starting playback.")
+                ready = [e for e in to_play if e["path"].exists()]
+                await self._load_playlist(ready)
+                initial_triggered = True
+
+        # All downloads attempted — reload playlist with all available files
+        ready = [e for e in to_play if e["path"].exists()]
+        if ready:
+            log.info(
+                f"Downloads complete — updating playlist "
+                f"({len(ready)}/{len(to_play)} files)."
+            )
+            await self._load_playlist(ready)
+
+        self._gc_cache(playlist_data)
+
+    async def _download_file(self, url: str, dest: Path) -> bool:
+        """Download url → dest using .tmp rename pattern.  Returns True on success."""
+        tmp = Path(str(dest) + ".tmp")
+        try:
+            async with self._http_client().stream("GET", url) as r:
+                r.raise_for_status()
+                with open(tmp, "wb") as f:
+                    async for chunk in r.aiter_bytes(chunk_size=65536):
+                        f.write(chunk)
+            tmp.rename(dest)
+            log.info(f"[SUCCESS] Downloaded {dest.name}")
+            return True
+        except Exception as e:
+            log.error(f"[ERROR] Failed to download {dest.name}: {e}")
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            return False
+
+    # ------------------------------------------------------------------
+    # Playlist playback engine
+    # ------------------------------------------------------------------
+
+    async def _load_playlist(self, items: list) -> None:
+        """
+        Replace the current playlist and start from item 0.
+        items = list of {path, duration, filename}
+        """
+        self._cancel_duration_timer()
+        # If we're switching from a native-loop single item to a multi-item
+        # playlist, disable the loop-file flag before loading the first item.
+        if len(items) != 1:
+            try:
+                self.mpv._mpv.loop_file = "no"
+            except Exception:
+                pass
+        self._playlist_items = items
+        self._current_index = -1
+        if items:
+            await self._play_index(0)
+
+    async def _play_index(self, index: int) -> None:
+        """Play the item at the given index."""
+        self._cancel_duration_timer()
+
+        if not self._playlist_items:
+            return
+
+        index = index % len(self._playlist_items)
+        self._current_index = index
+        item = self._playlist_items[index]
+
+        path: Path = item["path"]
+        duration: int = item.get("duration", 0) or 0
+        filename: str = item.get("filename", path.name)
+
+        if not path.exists():
+            log.warning(f"File not found, skipping: {path}")
+            await asyncio.sleep(0.5)
+            await self._advance()
+            return
+
+        is_img = _is_image(filename)
+
+        # For a single-item video playlist with no explicit duration, tell mpv
+        # to loop natively — this avoids any black frame on restart because mpv
+        # never actually unloads the file between loops.
+        single_item = len(self._playlist_items) == 1
+        use_loop = single_item and not is_img and duration == 0
+
+        log.info(
+            f"Playing [{index+1}/{len(self._playlist_items)}] "
+            f"{filename}  (duration={duration}, loop={use_loop})"
+        )
+        self.mpv.play_file(str(path), loop=use_loop)
+
+        if is_img:
+            # Images: always use a timer (default 10 s if duration == 0)
+            secs = duration if duration > 0 else DEFAULT_IMAGE_DURATION
+            self._duration_timer = asyncio.create_task(
+                self._duration_then_advance(secs)
+            )
+        elif duration > 0:
+            # Video with explicit duration: use a timer too
+            self._duration_timer = asyncio.create_task(
+                self._duration_then_advance(duration)
+            )
+        # else: video with duration==0 — wait for mpv EOF callback (or loop natively)
+
+    async def _duration_then_advance(self, seconds: float) -> None:
+        try:
+            await asyncio.sleep(seconds)
+            await self._advance()
+        except asyncio.CancelledError:
+            pass
+
+    async def _advance(self) -> None:
+        """Move to the next item (wraps around)."""
+        if not self._playlist_items:
+            return
+        next_index = (self._current_index + 1) % len(self._playlist_items)
+        await self._play_index(next_index)
+
+    def _cancel_duration_timer(self) -> None:
+        if self._duration_timer and not self._duration_timer.done():
+            self._duration_timer.cancel()
+        self._duration_timer = None
+
+    # ------------------------------------------------------------------
+    # Heartbeat
+    # ------------------------------------------------------------------
+
+    async def _heartbeat_loop(self) -> None:
+        """Send a heartbeat every 500 ms."""
+        while self._running:
+            await asyncio.sleep(0.5)
+            await self._send_heartbeat()
+
+    async def _send_heartbeat(self) -> None:
+        if not self._player_id:
+            return
+        try:
+            r = await self._http_client().post(
+                f"{self.cms_url}/api/v1/players/{self._player_id}/heartbeat",
+                json={
+                    "status": "online",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+            if r.status_code == 404:
+                log.warning(
+                    "[CMS DELETION] This player was removed — clearing state."
+                )
+                self.state.pop("player_id", None)
+                clear_state()
+                self._cancel_duration_timer()
+                self.mpv.cmd_stop()
+                # Re-enroll
+                asyncio.create_task(self._request_enrollment())
+                return
+
+            r.raise_for_status()
+            data = r.json()
+            await self._handle_heartbeat_command(data)
+
+        except httpx.HTTPStatusError:
+            pass  # already handled 404 above; other errors logged below
+        except Exception as e:
+            log.error(f"Heartbeat failed: {e}")
+
+    async def _handle_heartbeat_command(self, data: dict) -> None:
+        """Dispatch commands received in the heartbeat response."""
+        cmd = data.get("command")
+        if not cmd or cmd == "none":
+            return
+
+        log.info(f"[HEARTBEAT COMMAND] {cmd}")
+
+        if cmd == "load_playlist":
+            incoming_hash = data.get("playlist_hash") or data.get("playlist_id")
+            if incoming_hash and incoming_hash == self.last_playlist_hash:
+                log.info("Playlist unchanged (hash match) — skipping.")
+            else:
+                self.last_playlist_hash = incoming_hash or None
+                self.last_content_id = None
+                asyncio.create_task(self._fetch_playlist())
+
+        elif cmd == "load_content":
+            content_id = data.get("content_id")
+            if not content_id:
+                return
+            if content_id == self.last_content_id:
+                log.info("Same content already loaded — skipping.")
+            else:
+                self.last_content_id = content_id
+                self.last_playlist_hash = None
+                log.info(f"Loading direct content: {content_id}")
+                asyncio.create_task(self._load_single_content(content_id))
+
+        elif cmd == "play":
+            self.mpv.cmd_play()
+
+        elif cmd == "pause":
+            self.mpv.cmd_pause()
+
+        elif cmd == "next":
+            self._cancel_duration_timer()
+            asyncio.create_task(self._advance())
+
+        elif cmd == "previous":
+            self._cancel_duration_timer()
+            prev = (self._current_index - 1) % max(len(self._playlist_items), 1)
+            asyncio.create_task(self._play_index(prev))
+
+        elif cmd == "restart":
+            self._cancel_duration_timer()
+            asyncio.create_task(self._play_index(self._current_index))
+
+        else:
+            log.debug(f"Unknown command: {cmd}")
+
+    # ------------------------------------------------------------------
+    # LRU garbage collection
+    # ------------------------------------------------------------------
+
+    def _gc_cache(self, playlist_data: dict) -> None:
+        """Keep current playlist files + up to 1000 recent others (mirrors JS)."""
+        try:
+            current_files = set()
+            for item in playlist_data.get("items", []):
+                content_id = item.get("content_id")
+                if not content_id:
+                    continue
+                fn = None
+                if item.get("content") and item["content"].get("filename"):
+                    fn = item["content"]["filename"]
+                if not fn:
+                    fn = f"{content_id}.mp4"
+                current_files.add(fn)
+
+            file_stats = []
+            for f in CACHE_DIR.iterdir():
+                if f.is_file() and re.search(
+                    r"\.(mp4|webm|mkv|avi|mov|jpg|jpeg|png|gif|bmp|webp|svg)$",
+                    f.name, re.IGNORECASE
+                ):
+                    try:
+                        file_stats.append((f.stat().st_mtime, f))
+                    except OSError:
+                        pass
+
+            # Newest first
+            file_stats.sort(reverse=True)
+
+            MAX_UNASSIGNED = 1000
+            unassigned = 0
+            for _mtime, fp in file_stats:
+                if fp.name not in current_files:
+                    unassigned += 1
+                    if unassigned > MAX_UNASSIGNED:
+                        log.info(f"[GC] Deleting old file: {fp.name}")
+                        try:
+                            fp.unlink()
+                        except OSError as e:
+                            log.error(f"[GC] Delete error: {e}")
+        except Exception as e:
+            log.error(f"[GC] Error: {e}")
+
+    # ------------------------------------------------------------------
+    # Main run loop
+    # ------------------------------------------------------------------
+
+    async def run(self) -> None:
+        """Start the player.  Blocks until shutdown."""
+        self._loop = asyncio.get_running_loop()
+
+        # Ensure directories
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Ensure DISPLAY is set for X11 (required for mpv window on Linux)
+        if not os.environ.get("DISPLAY"):
+            os.environ["DISPLAY"] = self.display
+            log.info(f"Set DISPLAY={self.display}")
+
+        # Initialise mpv
+        self.mpv.initialise(self._loop)
+
+        # Wire up end-of-file → advance
+        self.mpv.set_eof_callback(self._on_eof)
+
+        # Validate cms_url
+        if not self.cms_url:
+            log.error(
+                "cms_url is not set in config.yaml.  "
+                "Please set cms_url and restart."
+            )
+            # Show message on screen and wait
+            self.mpv.show_osd(
+                "ERROR: cms_url not configured.\n"
+                "Please set cms_url in config.yaml and restart.",
+                duration_ms=3_600_000,
+            )
+            while self._running:
+                await asyncio.sleep(5)
+            return
+
+        # Enroll or start player routines
+        if self._player_id:
+            log.info(f"Resuming with player_id={self._player_id}")
+            await self._start_player_routines()
+        else:
+            log.info("No player_id found — starting enrollment.")
+            await self._request_enrollment()
+
+        # Keep running
+        while self._running:
+            await asyncio.sleep(1)
+
+    async def _on_eof(self) -> None:
+        """Called by mpv when a file reaches end-of-file (for videos with duration==0)."""
+        if self._playlist_items:
+            item = self._playlist_items[self._current_index] \
+                if 0 <= self._current_index < len(self._playlist_items) else None
+            if item:
+                filename = item.get("filename", "")
+                duration = item.get("duration", 0) or 0
+                # Only auto-advance if not an image and duration==0
+                # (images and timed items are handled by the duration timer)
+                if not _is_image(filename) and duration == 0:
+                    await self._advance()
+
+    def shutdown(self) -> None:
+        """Signal the run loop to stop."""
+        log.info("Shutting down...")
+        self._running = False
+        self._cancel_duration_timer()
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+        self.mpv.terminate()
+        if self._http and not self._http.is_closed:
+            asyncio.create_task(self._http.aclose())
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+async def _main() -> None:
+    cfg_raw = load_config()
+    player = Player(cfg_raw)
+
+    loop = asyncio.get_running_loop()
+
+    def _sig_handler(sig, _frame):
+        log.info(f"Received signal {sig} — shutting down.")
+        player.shutdown()
+        loop.stop()
+
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
+    try:
+        await player.run()
+    except Exception as e:
+        log.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())

@@ -1,0 +1,25 @@
+# Digital Signage Linux Player — configuration
+#
+# Copy this file to config.yaml and edit the values below.
+# The player searches for config.yaml in:
+#   1. ./config.yaml  (current working directory)
+#   2. /etc/signage-player/config.yaml
+#   3. ~/.config/signage-player/config.yaml
+#
+# Player identity (player_id) is stored automatically in
+# ~/.config/signage-player/state.json after enrollment.
+
+# CMS server base URL (required)
+cms_url: "http://cms-server:8000"
+
+# Playback settings (optional — defaults shown)
+playback:
+  # X display to use for mpv (Linux only)
+  display: ":0"
+  # Audio output device — "auto" lets mpv choose
+  audio_output: "auto"
+  # Default duration in seconds for images when the playlist item has duration=0
+  default_image_duration: 10
+
+# Log verbosity: DEBUG, INFO, WARNING, ERROR
+log_level: "INFO"

@@ -1,0 +1,26 @@
+[Unit]
+Description=Digital Signage Player Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=signage
+Group=signage
+WorkingDirectory=/opt/signage-player
+ExecStart=/usr/bin/python3 /opt/signage-player/main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+Environment="DISPLAY=:0"
+Environment="XAUTHORITY=/home/signage/.Xauthority"
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
