@@ -246,6 +246,7 @@ class MpvPlayer:
             except Exception:
                 pass
             self._mpv.play(path)
+            self._mpv.pause = False
 
     def show_osd(self, text: str, duration_ms: int = 10_000) -> None:
         """Display OSD text overlay.
