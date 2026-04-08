@@ -286,8 +286,33 @@ step "Installing system dependencies"
 
 install_deps_debian() {
     apt-get update -qq
-    apt-get install -y -qq python3 python3-pip python3-venv mpv libmpv-dev \
-        avahi-daemon libavahi-client-dev curl
+    # Install packages one-by-one so a held/broken package doesn't block the rest.
+    # mpv and libmpv-dev may already be installed (and held back by PPA conflicts).
+    local pkgs=(python3 python3-pip python3-venv mpv libmpv-dev avahi-daemon libavahi-client-dev curl)
+    local failed=()
+    for pkg in "${pkgs[@]}"; do
+        if dpkg -s "$pkg" &>/dev/null; then
+            info "$pkg is already installed — skipping"
+        else
+            if ! apt-get install -y -qq "$pkg" 2>/dev/null; then
+                warn "Could not install $pkg — will try to continue without it"
+                failed+=("$pkg")
+            fi
+        fi
+    done
+    # Hard-fail only if critical packages are missing
+    for critical in python3 python3-pip python3-venv curl; do
+        if ! command -v "${critical/python3-pip/pip3}" &>/dev/null && ! dpkg -s "$critical" &>/dev/null; then
+            fail "Critical package '$critical' could not be installed. Fix manually: sudo apt install $critical"
+        fi
+    done
+    # mpv is required but may already be present
+    if ! command -v mpv &>/dev/null; then
+        fail "mpv is not installed and could not be installed. Fix: sudo apt install mpv"
+    fi
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        warn "Some packages failed to install: ${failed[*]} — continuing with what's available"
+    fi
 }
 
 install_deps_fedora() {
