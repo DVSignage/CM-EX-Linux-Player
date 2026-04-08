@@ -288,7 +288,7 @@ install_deps_debian() {
     apt-get update -qq
     # Install packages one-by-one so a held/broken package doesn't block the rest.
     # mpv and libmpv-dev may already be installed (and held back by PPA conflicts).
-    local pkgs=(python3 python3-pip python3-venv mpv libmpv-dev avahi-daemon libavahi-client-dev curl)
+    local pkgs=(python3 python3-pip python3-venv mpv libmpv-dev avahi-daemon libavahi-client-dev curl libgtk2.0-0)
     local failed=()
     for pkg in "${pkgs[@]}"; do
         if dpkg -s "$pkg" &>/dev/null; then
