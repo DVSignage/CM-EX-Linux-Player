@@ -776,6 +776,7 @@ class Player:
     async def _play_index(self, index: int) -> None:
         """Play the item at the given index."""
         self._cancel_duration_timer()
+        self.mpv.clear_osd()
 
         if not self._playlist_items:
             return
@@ -1065,6 +1066,9 @@ class Player:
 
         # Initialise mpv
         self.mpv.initialise(self._loop)
+
+        # Clear any stale OSD from a previous run
+        self.mpv.clear_osd()
 
         # Wire up end-of-file → advance
         self.mpv.set_eof_callback(self._on_eof)
