@@ -382,9 +382,33 @@ class LocalApiServer:
     Serves endpoints that the CMS proxies to (NDI sources, preview, etc.)
     """
 
+    PREVIEW_PATH = CONFIG_DIR / "preview.jpg"
+
     def __init__(self):
         self._server = None
         self._thread = None
+        self._player = None  # Set via set_player()
+
+    def set_player(self, player) -> None:
+        """Give the API server a reference to the Player for preview captures."""
+        self._player = player
+
+    def _capture_screenshot(self) -> Optional[bytes]:
+        """Capture current mpv frame as JPEG bytes."""
+        if not self._player or not self._player.mpv._mpv:
+            return None
+        try:
+            tmp_path = str(self.PREVIEW_PATH)
+            self._player.mpv._mpv.command(
+                "screenshot-to-file", tmp_path, "video"
+            )
+            # Read and return
+            if self.PREVIEW_PATH.exists():
+                data = self.PREVIEW_PATH.read_bytes()
+                return data
+        except Exception as e:
+            log.debug(f"[PREVIEW] Screenshot failed: {e}")
+        return None
 
     def start(self) -> None:
         """Start the local API server on LOCAL_API_PORT."""
@@ -415,12 +439,57 @@ class LocalApiServer:
                     except Exception as e:
                         self._send_json({"error": str(e)}, 500)
 
+                elif self.path == "/api/preview/snapshot":
+                    jpeg_data = server_ref._capture_screenshot()
+                    if jpeg_data:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Content-Length", str(len(jpeg_data)))
+                        self.end_headers()
+                        self.wfile.write(jpeg_data)
+                    else:
+                        self._send_json(
+                            {"error": "Unable to capture frame"}, 503
+                        )
+
+                elif self.path == "/api/preview/stream":
+                    # MJPEG stream — push frames continuously
+                    self.send_response(200)
+                    self.send_header(
+                        "Content-Type",
+                        "multipart/x-mixed-replace; boundary=frame",
+                    )
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Connection", "keep-alive")
+                    self.end_headers()
+                    try:
+                        while True:
+                            jpeg_data = server_ref._capture_screenshot()
+                            if jpeg_data:
+                                self.wfile.write(b"--frame\r\n")
+                                self.wfile.write(
+                                    b"Content-Type: image/jpeg\r\n"
+                                )
+                                self.wfile.write(
+                                    f"Content-Length: {len(jpeg_data)}\r\n\r\n".encode()
+                                )
+                                self.wfile.write(jpeg_data)
+                                self.wfile.write(b"\r\n")
+                                self.wfile.flush()
+                            time.sleep(0.333)  # ~3 FPS
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass  # Client disconnected
+
                 elif self.path == "/api/device":
                     ip = _get_local_ip()
                     self._send_json({
                         "ip_address": ip,
                         "platform": "linux",
                         "ndi_available": ndi_available(),
+                        "preview_supported": True,
                     })
 
                 elif self.path == "/api/health":
@@ -1173,6 +1242,7 @@ class Player:
             log.info(f"Set DISPLAY={self.display}")
 
         # Start local API server (for CMS to proxy NDI sources, etc.)
+        self._local_api.set_player(self)
         self._local_api.start()
 
         # Initialise mpv
