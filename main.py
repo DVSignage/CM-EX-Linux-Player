@@ -573,6 +573,9 @@ class Player:
             )
             r.raise_for_status()
             playlist_data = r.json()
+            if not playlist_data:
+                log.info("No playlist assigned to this player on the CMS.")
+                return
             log.info("Playlist retrieved — processing downloads...")
             await self._process_and_download_playlist(playlist_data)
         except Exception as e:
