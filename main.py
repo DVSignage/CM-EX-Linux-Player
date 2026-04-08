@@ -71,6 +71,7 @@ CACHE_LIMIT_BYTES = 50 * 1024 * 1024 * 1024  # 50 GB
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg"}
 DEFAULT_IMAGE_DURATION = 10  # seconds when duration == 0 for an image
+LOCAL_API_PORT = 8081  # Local HTTP API (same as Windows player)
 
 # ---------------------------------------------------------------------------
 # Config loading (config.yaml)
@@ -352,6 +353,106 @@ def _cache_size_bytes() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Local IP detection
+# ---------------------------------------------------------------------------
+
+def _get_local_ip() -> str:
+    """Get the machine's LAN IP address."""
+    import socket
+    try:
+        # Connect to a public IP (doesn't actually send data) to determine
+        # which local interface is used for outbound traffic.
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# Local API server (mirrors Windows player api.js — port 8081)
+# ---------------------------------------------------------------------------
+
+class LocalApiServer:
+    """
+    Lightweight HTTP server that runs on a background thread.
+    Serves endpoints that the CMS proxies to (NDI sources, preview, etc.)
+    """
+
+    def __init__(self):
+        self._server = None
+        self._thread = None
+
+    def start(self) -> None:
+        """Start the local API server on LOCAL_API_PORT."""
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        import threading
+
+        server_ref = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                # Suppress default stderr logging
+                pass
+
+            def _send_json(self, data, status=200):
+                body = json.dumps(data).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path == "/api/ndi/sources":
+                    try:
+                        sources = ndi_find_sources(timeout_ms=3000)
+                        self._send_json(sources)
+                    except Exception as e:
+                        self._send_json({"error": str(e)}, 500)
+
+                elif self.path == "/api/device":
+                    ip = _get_local_ip()
+                    self._send_json({
+                        "ip_address": ip,
+                        "platform": "linux",
+                        "ndi_available": ndi_available(),
+                    })
+
+                elif self.path == "/api/health":
+                    self._send_json({"status": "ok"})
+
+                else:
+                    self._send_json({"error": "Not found"}, 404)
+
+            def do_OPTIONS(self):
+                self.send_response(200)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.end_headers()
+
+        try:
+            self._server = HTTPServer(("0.0.0.0", LOCAL_API_PORT), Handler)
+            self._thread = threading.Thread(
+                target=self._server.serve_forever, daemon=True, name="local-api"
+            )
+            self._thread.start()
+            log.info(f"Local API server listening on port {LOCAL_API_PORT}")
+        except Exception as e:
+            log.error(f"Failed to start local API server: {e}")
+
+    def stop(self) -> None:
+        if self._server:
+            self._server.shutdown()
+            self._server = None
+
+
+# ---------------------------------------------------------------------------
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
@@ -403,6 +504,10 @@ class Player:
         self._ndi_receiver: Optional[object] = None
         self._ndi_sender: Optional[object] = None
         self._ndi_active_key: Optional[str] = None  # dedup key for wall commands
+
+        # Local API server (so CMS can proxy NDI sources, preview, etc.)
+        self._local_api = LocalApiServer()
+        self._local_ip: str = _get_local_ip()
 
         if NDIReceiver is not None:
             self._ndi_receiver = NDIReceiver()
@@ -860,6 +965,8 @@ class Player:
                 "status": "online",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "ndi_available": ndi_available(),
+                "local_ip": self._local_ip,
+                "api_port": LOCAL_API_PORT,
             }
             # Include NDI broadcast info if active
             if self._ndi_sender and self._ndi_sender.active:
@@ -1065,6 +1172,9 @@ class Player:
             os.environ["DISPLAY"] = self.display
             log.info(f"Set DISPLAY={self.display}")
 
+        # Start local API server (for CMS to proxy NDI sources, etc.)
+        self._local_api.start()
+
         # Initialise mpv
         self.mpv.initialise(self._loop)
 
@@ -1128,6 +1238,7 @@ class Player:
         if self._ndi_sender:
             self._ndi_sender.stop()
         ndi_cleanup()
+        self._local_api.stop()
         self.mpv.terminate()
         if self._http and not self._http.is_closed:
             asyncio.create_task(self._http.aclose())
