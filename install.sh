@@ -419,41 +419,56 @@ step "Checking configuration"
 
 CONFIG_FILE="$INSTALL_DIR/config.yaml"
 
-if [[ -f "$CONFIG_FILE" ]]; then
-    ok "config.yaml already exists — preserving current configuration"
+write_full_config() {
+    # Write a complete, known-good config.yaml — no sed substitution needed
+    local url="$1"
+    cat > "$CONFIG_FILE" <<CFGEOF
+cms_url: "$url"
 
-    # If --cms was passed, update the URL even on existing configs
+playback:
+  display: "$X_DISPLAY"
+  audio_output: "auto"
+  default_image_duration: 10
+
+log_level: "INFO"
+CFGEOF
+    chown "$DESKTOP_USER:$DESKTOP_USER" "$CONFIG_FILE"
+}
+
+if [[ -f "$CONFIG_FILE" ]]; then
     if [[ -n "$ARG_CMS_URL" ]]; then
-        sed -i "s|cms_url:.*|cms_url: \"$ARG_CMS_URL\"|" "$CONFIG_FILE"
-        ok "cms_url updated to $ARG_CMS_URL (via --cms flag)"
+        # --cms flag: rewrite config with the provided URL (safe overwrite)
+        write_full_config "$ARG_CMS_URL"
+        ok "config.yaml rewritten with cms_url=$ARG_CMS_URL (via --cms flag)"
+    else
+        ok "config.yaml already exists — preserving current configuration"
     fi
 else
-    cp "$INSTALL_DIR/config.yaml.example" "$CONFIG_FILE"
-    chown "$DESKTOP_USER:$DESKTOP_USER" "$CONFIG_FILE"
-
-    # Priority 1: --cms command-line argument (non-interactive fleet deploy)
     if [[ -n "$ARG_CMS_URL" ]]; then
-        sed -i "s|cms_url:.*|cms_url: \"$ARG_CMS_URL\"|" "$CONFIG_FILE"
-        ok "cms_url set to $ARG_CMS_URL (via --cms flag)"
+        # Fleet deploy: write config directly
+        write_full_config "$ARG_CMS_URL"
+        ok "config.yaml created with cms_url=$ARG_CMS_URL (via --cms flag)"
     elif [[ -t 0 ]]; then
         # Priority 2: Interactive prompt
-        warn "Created config.yaml from template"
         echo ""
         echo -e "  ${BOLD}You must set the CMS URL.${NC}"
         echo ""
-        echo -e "  Set ${BOLD}cms_url${NC} to your CMS server address, e.g.:"
-        echo -e "    cms_url: \"http://192.168.1.100:8000\""
+        echo -e "  Enter your CMS server address, e.g.: ${CYAN}http://192.168.1.100:8000${NC}"
         echo ""
-        read -rp "  Enter your CMS URL now (or press Enter to skip): " CMS_URL
+        read -rp "  CMS URL: " CMS_URL
         if [[ -n "$CMS_URL" ]]; then
             CMS_URL="${CMS_URL%\"}"
             CMS_URL="${CMS_URL#\"}"
-            sed -i "s|cms_url:.*|cms_url: \"$CMS_URL\"|" "$CONFIG_FILE"
-            ok "cms_url set to $CMS_URL"
+            write_full_config "$CMS_URL"
+            ok "config.yaml created with cms_url=$CMS_URL"
         else
+            cp "$INSTALL_DIR/config.yaml.example" "$CONFIG_FILE"
+            chown "$DESKTOP_USER:$DESKTOP_USER" "$CONFIG_FILE"
             warn "Skipped — remember to edit $CONFIG_FILE before starting"
         fi
     else
+        cp "$INSTALL_DIR/config.yaml.example" "$CONFIG_FILE"
+        chown "$DESKTOP_USER:$DESKTOP_USER" "$CONFIG_FILE"
         warn "Non-interactive mode — edit $CONFIG_FILE or re-run with --cms URL"
     fi
 
