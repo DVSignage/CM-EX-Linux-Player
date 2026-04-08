@@ -530,6 +530,23 @@ ok "Service file installed at $SYSTEMD_FILE"
 # ---------------------------------------------------------------------------
 # Enable and start
 # ---------------------------------------------------------------------------
+step "Configuring firewall"
+
+# Open port 8081 (local player API — NDI sources, preview, device info)
+if command -v ufw &>/dev/null; then
+    if ufw status | grep -q "Status: active"; then
+        ufw allow 8081/tcp &>/dev/null && ok "ufw: opened port 8081 (player API)"
+    else
+        # ufw is inactive — enable it and open required ports
+        ufw allow ssh &>/dev/null        # keep SSH open!
+        ufw allow 8081/tcp &>/dev/null
+        ufw --force enable &>/dev/null
+        ok "ufw: enabled and opened port 8081 (player API)"
+    fi
+else
+    info "ufw not found — skipping firewall config (ensure port 8081 is accessible)"
+fi
+
 step "Enabling and starting service"
 
 systemctl enable signage-player
