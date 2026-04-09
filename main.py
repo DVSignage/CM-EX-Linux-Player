@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -163,6 +164,7 @@ class MpvPlayer:
             hwdec="auto",
             fs=True,                # fullscreen
             really_quiet=True,
+            osd_level=0,            # suppress all automatic OSD (filename, buffering, seek bar, etc.)
             osd_font_size=48,
             osd_duration=10000,
             # Prevent display / screensaver blanking during playback
@@ -1068,6 +1070,14 @@ class Player:
                 "--no-first-run",
                 "--disable-translate",
                 "--disable-features=TranslateUI",
+                "--disable-notifications",          # block web push notifications
+                "--no-default-browser-check",       # suppress "make default browser" popup
+                "--disable-session-crashed-bubble", # suppress crash recovery dialog
+                "--block-new-web-contents",         # prevent popup windows / new tabs
+                "--disable-popup-blocking",         # let the page open what it needs (but --block-new-web-contents overrides for new windows)
+                "--disable-background-networking",  # no background update checks
+                "--disable-client-side-phishing-detection",
+                "--disable-component-update",       # suppress Chrome update prompts
                 f"--display={self.display}",
                 url,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -1320,6 +1330,54 @@ class Player:
     # Main run loop
     # ------------------------------------------------------------------
 
+    def _suppress_desktop_popups(self) -> None:
+        """
+        Kill desktop notification daemons and update notifiers so they cannot
+        display popups over the fullscreen signage content.
+        Called once at startup — these services are not needed on a signage player.
+        """
+        # Notification daemons (any one of these may be running depending on DE)
+        daemons = [
+            "dunst",            # lightweight notification daemon
+            "notify-osd",       # Ubuntu legacy
+            "xfce4-notifyd",    # XFCE
+            "mako",             # Wayland
+            "swaync",           # Sway notification center
+            "xfce4-notifyd",
+            "mate-notification-daemon",
+            "lxqt-notificationd",
+            "cinnamon-notificationd",
+        ]
+        # Update / package manager popups
+        daemons += [
+            "update-notifier",
+            "update-manager",
+            "gnome-software",
+            "packageupdater",
+            "mintupdate",
+        ]
+        for name in daemons:
+            try:
+                subprocess.run(
+                    ["pkill", "-x", name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+
+        # Inhibit screensaver / power management popups via xdg-screensaver
+        try:
+            subprocess.Popen(
+                ["xdg-screensaver", "reset"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+        log.info("Desktop popups suppressed")
+
     async def run(self) -> None:
         """Start the player.  Blocks until shutdown."""
         self._loop = asyncio.get_running_loop()
@@ -1332,6 +1390,9 @@ class Player:
         if not os.environ.get("DISPLAY"):
             os.environ["DISPLAY"] = self.display
             log.info(f"Set DISPLAY={self.display}")
+
+        # Kill notification daemons and update popups before taking the screen
+        self._suppress_desktop_popups()
 
         # Start local API server (for CMS to proxy NDI sources, etc.)
         self._local_api.set_player(self)
