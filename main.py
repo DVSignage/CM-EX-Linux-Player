@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
 import time
@@ -334,6 +335,15 @@ def _is_image(filename: str) -> bool:
     return Path(filename).suffix.lower() in IMAGE_EXTENSIONS
 
 
+def _find_chromium() -> Optional[str]:
+    """Return path to a Chromium-compatible browser binary, or None."""
+    for candidate in ("chromium-browser", "chromium", "google-chrome-stable", "google-chrome"):
+        path = shutil.which(candidate)
+        if path:
+            return path
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Cache helpers
 # ---------------------------------------------------------------------------
@@ -565,6 +575,9 @@ class Player:
 
         # httpx client (shared)
         self._http: Optional[httpx.AsyncClient] = None
+
+        # Chromium process for template display
+        self._chromium_proc: Optional[asyncio.subprocess.Process] = None
 
         # asyncio event loop (set in run())
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -825,8 +838,22 @@ class Player:
             if not content_id:
                 continue
 
-            remote_url = f"{self.cms_url}/api/v1/content/{content_id}/stream"
             duration = item.get("duration", 0) or 0
+            content_type = item.get("content", {}).get("type", "")
+
+            # Templates are rendered HTML — display via browser, no download needed
+            if content_type == "template":
+                render_url = f"{self.cms_url}/api/v1/content/{content_id}/stream"
+                display_name = item.get("content", {}).get("name") or f"template_{content_id}"
+                to_play.append({
+                    "type": "template",
+                    "url": render_url,
+                    "duration": duration,
+                    "filename": display_name,
+                })
+                continue
+
+            remote_url = f"{self.cms_url}/api/v1/content/{content_id}/stream"
 
             # Determine filename / extension
             filename = None
@@ -888,14 +915,19 @@ class Player:
 
             # After first successful download, kick off playback with whatever
             # is available so far (only cached files will be included)
-            if not initial_triggered and to_play[0]["path"].exists():
+            first = to_play[0]
+            first_ready = (first.get("type") == "template" or
+                           (first.get("path") is not None and first["path"].exists()))
+            if not initial_triggered and first_ready:
                 log.info("First file ready — starting playback.")
-                ready = [e for e in to_play if e["path"].exists()]
+                ready = [e for e in to_play if e.get("type") == "template" or
+                         (e.get("path") is not None and e["path"].exists())]
                 await self._load_playlist(ready)
                 initial_triggered = True
 
         # All downloads attempted — reload playlist with all available files
-        ready = [e for e in to_play if e["path"].exists()]
+        ready = [e for e in to_play if e.get("type") == "template" or
+                 (e.get("path") is not None and e["path"].exists())]
         if ready:
             log.info(
                 f"Downloads complete — updating playlist "
@@ -960,6 +992,11 @@ class Player:
         self._current_index = index
         item = self._playlist_items[index]
 
+        # Templates are displayed via Chromium browser
+        if item.get("type") == "template":
+            await self._play_template(item)
+            return
+
         path: Path = item["path"]
         duration: int = item.get("duration", 0) or 0
         filename: str = item.get("filename", path.name)
@@ -997,6 +1034,54 @@ class Player:
             )
         # else: video with duration==0 — wait for mpv EOF callback (or loop natively)
 
+    async def _play_template(self, item: dict) -> None:
+        """Display a template in Chromium kiosk mode, then advance after duration."""
+        url: str = item["url"]
+        duration: int = item.get("duration", 0) or 0
+        effective_duration = duration if duration > 0 else 30
+        filename: str = item.get("filename", "template")
+
+        log.info(
+            f"Playing template [{self._current_index + 1}/{len(self._playlist_items)}] "
+            f"{filename}  (duration={effective_duration}s)"
+        )
+
+        chromium = _find_chromium()
+        if not chromium:
+            log.error("No Chromium browser found — cannot display template. Skipping.")
+            await asyncio.sleep(1)
+            await self._advance()
+            return
+
+        # Pause mpv so it doesn't run audio/video underneath
+        try:
+            self.mpv._mpv.pause = True
+        except Exception:
+            pass
+
+        try:
+            self._chromium_proc = await asyncio.create_subprocess_exec(
+                chromium,
+                "--kiosk",
+                "--noerrdialogs",
+                "--disable-infobars",
+                "--no-first-run",
+                "--disable-translate",
+                "--disable-features=TranslateUI",
+                f"--display={self.display}",
+                url,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except Exception as e:
+            log.error(f"Failed to launch Chromium for template: {e}")
+            await self._advance()
+            return
+
+        self._duration_timer = asyncio.create_task(
+            self._duration_then_advance(effective_duration)
+        )
+
     async def _duration_then_advance(self, seconds: float) -> None:
         try:
             await asyncio.sleep(seconds)
@@ -1015,6 +1100,13 @@ class Player:
         if self._duration_timer and not self._duration_timer.done():
             self._duration_timer.cancel()
         self._duration_timer = None
+        # Kill any running Chromium browser (template display)
+        if self._chromium_proc is not None:
+            try:
+                self._chromium_proc.terminate()
+            except Exception:
+                pass
+            self._chromium_proc = None
 
     # ------------------------------------------------------------------
     # Heartbeat
