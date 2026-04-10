@@ -163,9 +163,9 @@ class MpvPlayer:
             osc=False,
             ytdl=False,
             idle=True,              # keep window open even with nothing playing
-            keep_open="yes",        # keep window open after file ends; "always" caused a
-                                    # spurious second end-file event when transitioning
-                                    # between videos, breaking multi-video playlists
+            keep_open="always",     # freeze last frame on EOF for smooth transitions;
+                                    # the _eof_pending guard handles any spurious second
+                                    # end-file event this can cause between videos
             force_window="yes",
             hwdec="auto",
             fs=True,                # fullscreen
