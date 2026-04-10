@@ -152,6 +152,10 @@ class MpvPlayer:
         # Guard flag: True while we're deliberately loading a new file so that
         # the end-file callback for the interrupted previous file is ignored.
         self._deliberate_load = False
+        # Dedup guard: True once we've scheduled _on_eof for the current file.
+        # Prevents a second end-file event (can occur with keep_open) from
+        # scheduling a second advance before the first one completes.
+        self._eof_pending = False
 
         kwargs = dict(
             input_default_bindings=False,
@@ -159,7 +163,9 @@ class MpvPlayer:
             osc=False,
             ytdl=False,
             idle=True,              # keep window open even with nothing playing
-            keep_open="always",     # freeze last frame on EOF instead of going black
+            keep_open="yes",        # keep window open after file ends; "always" caused a
+                                    # spurious second end-file event when transitioning
+                                    # between videos, breaking multi-video playlists
             force_window="yes",
             hwdec="auto",
             fs=True,                # fullscreen
@@ -194,8 +200,9 @@ class MpvPlayer:
 
         @self._mpv.event_callback("file-loaded")
         def _on_file_loaded(event):
-            # New file has started — any subsequent end-file is a genuine EOF
+            # New file has started — reset both guards for the fresh file
             self._deliberate_load = False
+            self._eof_pending = False
 
         @self._mpv.event_callback("end-file")
         def _on_end_file(event):
@@ -224,9 +231,17 @@ class MpvPlayer:
             if hasattr(reason, "value"):
                 reason = reason.value
 
+            log.debug(f"end-file reason={reason!r} deliberate={self._deliberate_load} eof_pending={self._eof_pending}")
+
             # Only advance on natural end-of-file.
             # stop / quit / error / redirect must NOT trigger an advance.
             if str(reason).lower() in ("eof", "0") or reason == 0:
+                # Dedup: only schedule _on_eof once per file play.
+                # A second end-file with reason=eof can arrive when keep_open
+                # transitions from the paused-at-end state to a new file.
+                if self._eof_pending:
+                    return
+                self._eof_pending = True
                 if self._eof_callback and self._loop:
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._eof_callback()
