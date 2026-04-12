@@ -125,7 +125,7 @@ ok "Downloaded ${DEB_COUNT} system packages"
 info "Downloading Python wheels..."
 
 # Read version pins from requirements.txt (skip NDI — optional and huge)
-CORE_PKGS="python-mpv>=1.0.1 httpx>=0.24.1 PyYAML>=6.0 aiofiles>=23.1.0"
+CORE_PKGS="python-mpv>=1.0.1 httpx>=0.24.1 PyYAML>=6.0 aiofiles>=23.1.0 psutil>=5.9.0"
 
 docker run --rm \
     -v "${WHEELS_DIR}:/wheels" \

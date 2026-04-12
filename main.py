@@ -36,6 +36,12 @@ try:
 except ImportError:
     _mpv_module = None
 
+# psutil — system metrics (optional — gracefully disabled if not installed)
+try:
+    import psutil as _psutil
+except ImportError:
+    _psutil = None
+
 # NDI support (optional — gracefully disabled if not installed)
 try:
     from ndi.engine import (
@@ -74,6 +80,7 @@ CACHE_LIMIT_BYTES = 50 * 1024 * 1024 * 1024  # 50 GB
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg"}
 DEFAULT_IMAGE_DURATION = 10  # seconds when duration == 0 for an image
 LOCAL_API_PORT = 8081  # Local HTTP API (same as Windows player)
+PLAYER_VERSION = "1.0.0"
 
 # ---------------------------------------------------------------------------
 # Config loading (config.yaml)
@@ -598,6 +605,9 @@ class Player:
 
         # asyncio event loop (set in run())
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Player start time (for uptime reporting)
+        self._start_time: float = time.time()
 
         # NDI state
         self._ndi_receiver: Optional[object] = None
@@ -1153,7 +1163,35 @@ class Player:
                 "ndi_available": ndi_available(),
                 "local_ip": self._local_ip,
                 "api_port": LOCAL_API_PORT,
+                "player_version": PLAYER_VERSION,
+                "uptime_seconds": int(time.time() - self._start_time),
             }
+
+            # Playback state
+            if self._playlist_items and 0 <= self._current_index < len(self._playlist_items):
+                item = self._playlist_items[self._current_index]
+                heartbeat_payload["current_content_name"] = item.get("filename", "")
+                heartbeat_payload["playlist_index"] = self._current_index
+                heartbeat_payload["playlist_total"] = len(self._playlist_items)
+
+            # System metrics (psutil — optional)
+            if _psutil is not None:
+                try:
+                    heartbeat_payload["cpu_percent"] = round(_psutil.cpu_percent(interval=None), 1)
+                    heartbeat_payload["memory_percent"] = round(_psutil.virtual_memory().percent, 1)
+                    heartbeat_payload["disk_percent"] = round(_psutil.disk_usage("/").percent, 1)
+                except Exception:
+                    pass
+                # CPU temperature — try common Linux thermal sensor keys
+                try:
+                    temps = _psutil.sensors_temperatures()
+                    for _key in ("coretemp", "k10temp", "cpu_thermal", "acpitz", "cpu-thermal"):
+                        if _key in temps and temps[_key]:
+                            heartbeat_payload["cpu_temp"] = round(temps[_key][0].current, 1)
+                            break
+                except Exception:
+                    pass
+
             # Include NDI broadcast info if active
             if self._ndi_sender and self._ndi_sender.active:
                 heartbeat_payload["ndi_broadcast_active"] = True
