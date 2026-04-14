@@ -258,17 +258,25 @@ class MpvPlayer:
         """Register an async callable to invoke when a file finishes playing."""
         self._eof_callback = coro_fn
 
-    def play_file(self, path: str, loop: bool = False) -> None:
-        """Load and play a local file path (or URL).
+    def play_file(self, path: str, loop: bool = False, vf: Optional[str] = None) -> None:
+        """Load and play a local file path or URL.
 
         Sets _deliberate_load=True before calling play() so the end-file
         callback for any currently-playing file is ignored (it was stopped
         intentionally, not via natural EOF).
+
+        vf: optional mpv video filter string, e.g. "crop=960:1080:0:0".
+            Pass None to clear any previously-set filter.
         """
         if self._mpv:
             self._deliberate_load = True
             try:
                 self._mpv.loop_file = "inf" if loop else "no"
+            except Exception:
+                pass
+            # Apply or clear video filter (crop for wall mode)
+            try:
+                self._mpv.vf = vf if vf else ""
             except Exception:
                 pass
             self._mpv.play(path)
@@ -365,6 +373,24 @@ def _find_chromium() -> Optional[str]:
         path = shutil.which(candidate)
         if path:
             return path
+    return None
+
+
+def _build_crop_filter(crop: Optional[dict]) -> Optional[str]:
+    """Convert wall_crop dict {x, y, w, h, ...} to an mpv crop filter string.
+
+    mpv crop filter syntax: crop=out_w:out_h:x:y
+    All values are in pixels, matching the canvas_w x canvas_h source resolution.
+    Returns None if crop is absent or invalid.
+    """
+    if not crop:
+        return None
+    w = int(crop.get("w", 0))
+    h = int(crop.get("h", 0))
+    x = int(crop.get("x", 0))
+    y = int(crop.get("y", 0))
+    if w > 0 and h > 0:
+        return f"crop={w}:{h}:{x}:{y}"
     return None
 
 
@@ -1117,6 +1143,60 @@ class Player:
             self._duration_then_advance(effective_duration)
         )
 
+    # ------------------------------------------------------------------
+    # Video wall helpers
+    # ------------------------------------------------------------------
+
+    async def _load_wall_content(self, content_id: str, crop: Optional[dict]) -> None:
+        """Image wall: download content and play it full-screen with a crop filter."""
+        try:
+            r = await self._http_client().get(
+                f"{self.cms_url}/api/v1/content/{content_id}"
+            )
+            r.raise_for_status()
+            meta = r.json()
+            filename = meta.get("filename") or f"{content_id}"
+        except Exception as e:
+            log.error(f"[WALL] Failed to fetch content metadata for {content_id}: {e}")
+            return
+
+        cache_path = CACHE_DIR / filename
+        if not cache_path.exists():
+            try:
+                log.info(f"[WALL] Downloading {filename}")
+                async with self._http_client().stream(
+                    "GET", f"{self.cms_url}/api/v1/content/{content_id}/stream"
+                ) as resp:
+                    resp.raise_for_status()
+                    import aiofiles
+                    async with aiofiles.open(cache_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(65536):
+                            await f.write(chunk)
+            except Exception as e:
+                log.error(f"[WALL] Download failed for {filename}: {e}")
+                return
+
+        vf = _build_crop_filter(crop)
+        log.info(f"[WALL] Playing {filename} vf={vf!r}")
+        self._cancel_duration_timer()
+        self.mpv.cmd_stop()
+        self.mpv.play_file(str(cache_path), loop=True, vf=vf)
+
+    async def _play_wall_rtp(self, rtp_url: str, crop: Optional[dict]) -> None:
+        """Video wall: open RTP multicast stream from the server and crop this player's region.
+
+        The server runs ffmpeg which loops the video, so mpv just plays the
+        continuous stream — no EOF handling needed.  Buffering options help
+        smooth out network jitter on the LAN.
+        """
+        vf = _build_crop_filter(crop)
+        log.info(f"[WALL RTP] Opening {rtp_url} vf={vf!r}")
+        self._cancel_duration_timer()
+        self.mpv.cmd_stop()
+        # Brief pause so the previous file-stop settles before we open UDP
+        await asyncio.sleep(0.2)
+        self.mpv.play_file(rtp_url, loop=False, vf=vf)
+
     async def _duration_then_advance(self, seconds: float) -> None:
         try:
             await asyncio.sleep(seconds)
@@ -1241,6 +1321,7 @@ class Player:
             else:
                 self.last_playlist_hash = incoming_hash or None
                 self.last_content_id = None
+                self._ndi_active_key = None  # exit wall mode
                 asyncio.create_task(self._fetch_playlist())
 
         elif cmd == "load_content":
@@ -1252,6 +1333,7 @@ class Player:
             else:
                 self.last_content_id = content_id
                 self.last_playlist_hash = None
+                self._ndi_active_key = None  # exit wall mode
                 log.info(f"Loading direct content: {content_id}")
                 asyncio.create_task(self._load_single_content(content_id))
 
@@ -1317,6 +1399,34 @@ class Player:
                             "h": crop.get("h", 1),
                         }
                     self._ndi_receiver.start(source_name, crop=ndi_crop)
+
+        elif cmd == "load_wall_content":
+            # Image (or static) wall — download the content and play it cropped
+            content_id = data.get("wall_content_id")
+            crop = data.get("wall_crop")
+            if not content_id:
+                return
+            wall_key = f"content_{content_id}_{json.dumps(crop, sort_keys=True)}"
+            if wall_key == self._ndi_active_key:
+                log.debug("[WALL] Same image wall already active — skip")
+                return
+            self._ndi_active_key = wall_key
+            log.info(f"[WALL] Image wall: content={content_id} crop={crop}")
+            asyncio.create_task(self._load_wall_content(content_id, crop))
+
+        elif cmd == "load_wall_rtp":
+            # Video wall — receive RTP multicast stream and crop this player's region
+            rtp_url = data.get("rtp_url")
+            crop = data.get("wall_crop")
+            if not rtp_url:
+                return
+            wall_key = f"rtp_{rtp_url}_{json.dumps(crop, sort_keys=True)}"
+            if wall_key == self._ndi_active_key:
+                log.debug("[WALL RTP] Same RTP wall already active — skip")
+                return
+            self._ndi_active_key = wall_key
+            log.info(f"[WALL RTP] {rtp_url} crop={crop}")
+            asyncio.create_task(self._play_wall_rtp(rtp_url, crop))
 
         elif cmd == "start_ndi_broadcast":
             if self._ndi_sender:
