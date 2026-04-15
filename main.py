@@ -377,10 +377,13 @@ def _find_chromium() -> Optional[str]:
 
 
 def _build_crop_filter(crop: Optional[dict]) -> Optional[str]:
-    """Convert wall_crop dict {x, y, w, h, ...} to an mpv crop filter string.
+    """Convert wall_crop dict {x, y, w, h, canvas_w, canvas_h} to an mpv filter string.
 
-    mpv crop filter syntax: crop=out_w:out_h:x:y
-    All values are in pixels, matching the canvas_w x canvas_h source resolution.
+    First scales the source to the full canvas size (canvas_w x canvas_h) so the
+    video fills the entire wall regardless of native resolution, then crops the
+    portion assigned to this display.
+
+    mpv filter syntax: scale=W:H,crop=out_w:out_h:x:y
     Returns None if crop is absent or invalid.
     """
     if not crop:
@@ -389,7 +392,11 @@ def _build_crop_filter(crop: Optional[dict]) -> Optional[str]:
     h = int(crop.get("h", 0))
     x = int(crop.get("x", 0))
     y = int(crop.get("y", 0))
+    canvas_w = int(crop.get("canvas_w", 0))
+    canvas_h = int(crop.get("canvas_h", 0))
     if w > 0 and h > 0:
+        if canvas_w > 0 and canvas_h > 0:
+            return f"scale={canvas_w}:{canvas_h},crop={w}:{h}:{x}:{y}"
         return f"crop={w}:{h}:{x}:{y}"
     return None
 
