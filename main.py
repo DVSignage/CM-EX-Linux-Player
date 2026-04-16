@@ -1220,8 +1220,22 @@ class Player:
         log.info(f"[WALL RTP] Opening {rtp_url} vf={vf!r} sync_at={play_at_ms}")
         self._cancel_duration_timer()
         self.mpv.cmd_stop()
-        # Brief pause so the previous file-stop settles before we open UDP
-        await asyncio.sleep(0.2)
+        # Allow mpv to fully stop before opening the UDP socket
+        await asyncio.sleep(0.5)
+
+        # Set UDP/network-friendly demuxer options so mpv probes quickly
+        # instead of waiting for 5 MB of data (the default).
+        # MPEG-TS is self-describing so a small probe is sufficient.
+        for _k, _v in {
+            "demuxer-lavf-probesize": 131072,  # 128 KB instead of 5 MB default
+            "demuxer-lavf-analyzeduration": 0.5,  # 0.5 s instead of 5 s default
+            "cache": "yes",
+            "cache-secs": 3,
+        }.items():
+            try:
+                self.mpv._mpv[_k] = _v
+            except Exception:
+                pass
 
         if play_at_ms:
             now_ms = int(time.time() * 1000)
@@ -1236,10 +1250,24 @@ class Player:
                 except Exception:
                     pass
                 log.info("[WALL RTP] Synchronized start — unpaused")
-                return
+                # Fall through to the blank-screen retry check below
+            else:
+                self.mpv.play_file(rtp_url, loop=False, vf=vf)
+        else:
+            # No sync timestamp (or in the past) — play immediately
+            self.mpv.play_file(rtp_url, loop=False, vf=vf)
 
-        # No sync timestamp (or in the past) — play immediately
-        self.mpv.play_file(rtp_url, loop=False, vf=vf)
+        # Blank-screen guard: if mpv is still idle 4 seconds after we told it to
+        # play, the stream wasn't available yet (ffmpeg still starting, or a
+        # network hiccup). Retry once — the stream will be on the wire by now.
+        await asyncio.sleep(4.0)
+        try:
+            idle = self.mpv._mpv["core-idle"]
+            if idle:
+                log.warning("[WALL RTP] Stream appears blank — retrying now")
+                self.mpv.play_file(rtp_url, loop=False, vf=vf)
+        except Exception:
+            pass
 
     async def _duration_then_advance(self, seconds: float) -> None:
         try:
