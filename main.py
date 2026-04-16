@@ -1495,8 +1495,15 @@ class Player:
                 return
             wall_key = f"rtp_{rtp_url}_{json.dumps(crop, sort_keys=True)}"
             if wall_key == self._ndi_active_key:
-                log.debug("[WALL RTP] Same RTP wall already active — skip")
-                return
+                # Same stream — only skip if mpv is actually playing.
+                # If mpv is idle (blank screen), the first attempt failed so retry.
+                try:
+                    if not self.mpv._mpv["core-idle"]:
+                        log.debug("[WALL RTP] Same RTP wall active and playing — skip")
+                        return
+                    log.info("[WALL RTP] Same key but mpv idle — retrying stream")
+                except Exception:
+                    return
             self._ndi_active_key = wall_key
             log.info(f"[WALL RTP] {rtp_url} crop={crop} play_at_ms={play_at_ms}")
             asyncio.create_task(self._play_wall_rtp(rtp_url, crop, play_at_ms=play_at_ms))
