@@ -279,6 +279,12 @@ class MpvPlayer:
                 self._mpv.vf = vf if vf else ""
             except Exception:
                 pass
+            # Disable aspect ratio correction when a crop filter is active
+            # so mpv doesn't add letterboxing after our scale+crop filter chain
+            try:
+                self._mpv.keepaspect = False if vf else True
+            except Exception:
+                pass
             self._mpv.play(path)
             self._mpv.pause = False
 
@@ -379,11 +385,11 @@ def _find_chromium() -> Optional[str]:
 def _build_crop_filter(crop: Optional[dict]) -> Optional[str]:
     """Convert wall_crop dict {x, y, w, h, canvas_w, canvas_h} to an mpv filter string.
 
-    First scales the source to the full canvas size (canvas_w x canvas_h) so the
-    video fills the entire wall regardless of native resolution, then crops the
-    portion assigned to this display.
+    Scales the source to the full canvas size (force-stretching to fill,
+    no letterboxing), resets SAR so mpv doesn't re-apply aspect correction
+    at the output stage, then crops the portion assigned to this display.
 
-    mpv filter syntax: scale=W:H,crop=out_w:out_h:x:y
+    mpv filter syntax: scale=W:H:force_original_aspect_ratio=disable,setsar=1,crop=W:H:X:Y
     Returns None if crop is absent or invalid.
     """
     if not crop:
@@ -396,7 +402,12 @@ def _build_crop_filter(crop: Optional[dict]) -> Optional[str]:
     canvas_h = int(crop.get("canvas_h", 0))
     if w > 0 and h > 0:
         if canvas_w > 0 and canvas_h > 0:
-            return f"scale={canvas_w}:{canvas_h},crop={w}:{h}:{x}:{y}"
+            return (
+                f"scale={canvas_w}:{canvas_h}"
+                f":force_original_aspect_ratio=disable"
+                f",setsar=1"
+                f",crop={w}:{h}:{x}:{y}"
+            )
         return f"crop={w}:{h}:{x}:{y}"
     return None
 
