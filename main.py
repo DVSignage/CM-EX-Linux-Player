@@ -1193,19 +1193,33 @@ class Player:
         try:
             await asyncio.sleep(0.3)
 
-            # Tune mpv for low-latency UDP
+            # Tune mpv for low-latency wall streaming
             for _k, _v in {
-                "demuxer-lavf-probesize": 131072,
-                "demuxer-lavf-analyzeduration": 0.5,
-                "cache": "yes",
-                "cache-secs": 3,
+                # Demuxer: fast probe for MPEG-TS
+                "demuxer-lavf-probesize": 131072,       # 128 KB (3.2: keep)
+                "demuxer-lavf-analyzeduration": 0.5,    # 0.5s (3.3: keep)
+                # Cache: minimal — server handles buffering
+                "cache": "no",                          # 3.1: no client cache
+                # Low-latency profile
+                "profile": "low-latency",               # 3.4: audio-buffer=0, untimed, etc.
+                "video-sync": "audio",                  # 3.5: no display-resample buffer
+                "audio-buffer": 0,                      # 3.6: zero audio buffer
+                # Wall mode: don't hold last frame on stream end
+                "keep-open": "no",                      # 3.8: clean transitions
             }.items():
                 try:
                     self.mpv._mpv[_k] = _v
                 except Exception:
                     pass
 
-            self.mpv.play_file(rtp_url, loop=False, vf=vf)
+            # 3.7: Add UDP buffer params for reliable reception
+            stream_url = rtp_url
+            if "?" in stream_url:
+                stream_url += "&buffer_size=16777216&fifo_size=50000000&overrun_nonfatal=1"
+            else:
+                stream_url += "?buffer_size=16777216&fifo_size=50000000&overrun_nonfatal=1"
+
+            self.mpv.play_file(stream_url, loop=False, vf=vf)
 
             # Monitor for stream death: if mpv goes idle while we're supposed
             # to be playing, the stream died (server restarted ffmpeg).
@@ -1217,11 +1231,21 @@ class Player:
                     if self.mpv._mpv["core-idle"]:
                         log.warning("[WALL STREAM] Stream died — clearing key for auto-recovery")
                         self._ndi_active_key = None
+                        # Restore keep-open for normal playlist playback
+                        try:
+                            self.mpv._mpv["keep-open"] = "always"
+                        except Exception:
+                            pass
                         return
                 except Exception:
                     return
         except asyncio.CancelledError:
             log.info("[WALL STREAM] Task cancelled (switching content)")
+            # Restore keep-open for normal playlist playback
+            try:
+                self.mpv._mpv["keep-open"] = "always"
+            except Exception:
+                pass
             return
 
     async def _duration_then_advance(self, seconds: float) -> None:
@@ -1368,6 +1392,11 @@ class Player:
             self._wall_crop = None
             self._cancel_wall_rtp_task()
             self.mpv.cmd_stop()
+            # Restore keep-open for normal playlist playback
+            try:
+                self.mpv._mpv["keep-open"] = "always"
+            except Exception:
+                pass
             # Resume individual playlist if we have one
             if self._playlist_items:
                 asyncio.create_task(self._play_index(self._current_index))
