@@ -634,7 +634,7 @@ class Player:
         self.last_content_id: Optional[str] = None
         self.boot_cache_loaded: bool = False
 
-        # Wall playlist mode: when set, _play_index applies this crop to every item
+        # Wall playlist mode (deprecated — server now streams everything)
         self._wall_crop: Optional[dict] = None
 
         # Current playlist state
@@ -853,28 +853,6 @@ class Player:
                     await self._process_and_download_playlist(offline_data)
                 except Exception as e2:
                     log.error(f"Failed to parse offline playlist: {e2}")
-
-    # ------------------------------------------------------------------
-    # Fetch playlist by ID (for wall playlist mode)
-    # ------------------------------------------------------------------
-
-    async def _fetch_playlist_by_id(self, playlist_id: str) -> None:
-        """Fetch a specific playlist from the CMS and play it.
-        Used by wall playlist mode — the _wall_crop is already set before calling this."""
-        try:
-            log.info(f"[WALL PLAYLIST] Fetching playlist {playlist_id}...")
-            r = await self._http_client().get(
-                f"{self.cms_url}/api/v1/playlists/{playlist_id}"
-            )
-            r.raise_for_status()
-            playlist_data = r.json()
-            if not playlist_data or not playlist_data.get("items"):
-                log.warning("[WALL PLAYLIST] Playlist is empty")
-                return
-            log.info(f"[WALL PLAYLIST] Processing {len(playlist_data['items'])} items with wall crop")
-            await self._process_and_download_playlist(playlist_data)
-        except Exception as e:
-            log.error(f"[WALL PLAYLIST] Failed to fetch playlist {playlist_id}: {e}")
 
     # ------------------------------------------------------------------
     # Load single content item (load_content command)
@@ -1197,69 +1175,25 @@ class Player:
     # Video wall helpers
     # ------------------------------------------------------------------
 
-    async def _load_wall_content(self, content_id: str, crop: Optional[dict]) -> None:
-        """Image wall: download content and play it full-screen with a crop filter."""
-        try:
-            r = await self._http_client().get(
-                f"{self.cms_url}/api/v1/content/{content_id}"
-            )
-            r.raise_for_status()
-            meta = r.json()
-            filename = meta.get("filename") or f"{content_id}"
-        except Exception as e:
-            log.error(f"[WALL] Failed to fetch content metadata for {content_id}: {e}")
-            return
+    async def _play_wall_rtp(self, rtp_url: str, crop: Optional[dict]) -> None:
+        """Video wall: open the server-side multicast stream and crop this player's region.
 
-        cache_path = CACHE_DIR / filename
-        if not cache_path.exists():
-            try:
-                log.info(f"[WALL] Downloading {filename}")
-                async with self._http_client().stream(
-                    "GET", f"{self.cms_url}/api/v1/content/{content_id}/stream"
-                ) as resp:
-                    resp.raise_for_status()
-                    import aiofiles
-                    async with aiofiles.open(cache_path, "wb") as f:
-                        async for chunk in resp.aiter_bytes(65536):
-                            await f.write(chunk)
-            except Exception as e:
-                log.error(f"[WALL] Download failed for {filename}: {e}")
-                return
-
-        vf = _build_crop_filter(crop)
-        log.info(f"[WALL] Playing {filename} vf={vf!r}")
-        self._cancel_duration_timer()
-        self.mpv.cmd_stop()
-        self.mpv.play_file(str(cache_path), loop=True, vf=vf)
-
-    async def _play_wall_rtp(self, rtp_url: str, crop: Optional[dict],
-                              play_at_ms: Optional[int] = None) -> None:
-        """Video wall: open RTP multicast stream from the server and crop this player's region.
-
-        The server runs ffmpeg which loops the video, so mpv just plays the
-        continuous stream — no EOF handling needed.
-
-        play_at_ms: UTC millisecond timestamp at which ALL players in this wall
-            group should begin rendering.  The player opens the stream and buffers
-            immediately (paused), then waits until the moment and unpauses.  This
-            keeps every screen in the group frame-accurate at start time.
-            If None or already in the past, playback begins immediately.
+        The server streams everything (video, images, playlists) via ffmpeg.
+        This player just opens the URL and applies the crop filter. No downloads,
+        no sync timestamps, no retry loops — the stream is always on the wire.
         """
         vf = _build_crop_filter(crop)
-        log.info(f"[WALL RTP] Opening {rtp_url} vf={vf!r} sync_at={play_at_ms}")
+        log.info(f"[WALL STREAM] Opening {rtp_url} vf={vf!r}")
         self._cancel_duration_timer()
         self.mpv.cmd_stop()
 
         try:
-            # Allow mpv to fully stop before opening the UDP socket
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
-            # Set UDP/network-friendly demuxer options so mpv probes quickly
-            # instead of waiting for 5 MB of data (the default).
-            # MPEG-TS is self-describing so a small probe is sufficient.
+            # Tune mpv for low-latency UDP
             for _k, _v in {
-                "demuxer-lavf-probesize": 131072,  # 128 KB instead of 5 MB default
-                "demuxer-lavf-analyzeduration": 0.5,  # 0.5 s instead of 5 s default
+                "demuxer-lavf-probesize": 131072,
+                "demuxer-lavf-analyzeduration": 0.5,
                 "cache": "yes",
                 "cache-secs": 3,
             }.items():
@@ -1268,37 +1202,9 @@ class Player:
                 except Exception:
                     pass
 
-            if play_at_ms:
-                now_ms = int(time.time() * 1000)
-                delay_ms = play_at_ms - now_ms
-                if delay_ms > 100:
-                    # Start buffering immediately (paused), then release at the sync moment
-                    self.mpv.play_file(rtp_url, loop=False, vf=vf, start_paused=True)
-                    log.info(f"[WALL RTP] Buffering — synchronized start in {delay_ms}ms")
-                    await asyncio.sleep(delay_ms / 1000.0)
-                    try:
-                        self.mpv._mpv.pause = False
-                    except Exception:
-                        pass
-                    log.info("[WALL RTP] Synchronized start — unpaused")
-                else:
-                    self.mpv.play_file(rtp_url, loop=False, vf=vf)
-            else:
-                # No sync timestamp (or in the past) — play immediately
-                self.mpv.play_file(rtp_url, loop=False, vf=vf)
-
-            # Blank-screen guard: if mpv is still idle 4 seconds after play,
-            # the stream wasn't available yet. Retry once.
-            await asyncio.sleep(4.0)
-            try:
-                idle = self.mpv._mpv["core-idle"]
-                if idle:
-                    log.warning("[WALL RTP] Stream appears blank — retrying now")
-                    self.mpv.play_file(rtp_url, loop=False, vf=vf)
-            except Exception:
-                pass
+            self.mpv.play_file(rtp_url, loop=False, vf=vf)
         except asyncio.CancelledError:
-            log.info("[WALL RTP] Task cancelled (switching to new content)")
+            log.info("[WALL STREAM] Task cancelled (switching content)")
             return
 
     async def _duration_then_advance(self, seconds: float) -> None:
@@ -1526,68 +1432,28 @@ class Player:
                         }
                     self._ndi_receiver.start(source_name, crop=ndi_crop)
 
-        elif cmd == "load_wall_content":
-            # Image (or static) wall — download the content and play it cropped
-            content_id = data.get("wall_content_id")
-            crop = data.get("wall_crop")
-            if not content_id:
-                return
-            wall_key = f"content_{content_id}_{json.dumps(crop, sort_keys=True)}"
-            if wall_key == self._ndi_active_key:
-                log.debug("[WALL] Same image wall already active — skip")
-                return
-            self._cancel_wall_rtp_task()
-            self._ndi_active_key = wall_key
-            log.info(f"[WALL] Image wall: content={content_id} crop={crop}")
-            asyncio.create_task(self._load_wall_content(content_id, crop))
-
         elif cmd == "load_wall_rtp":
-            # Video wall — receive RTP multicast stream and crop this player's region
+            # Wall stream — server streams all content types via ffmpeg multicast
             rtp_url = data.get("rtp_url")
             crop = data.get("wall_crop")
-            play_at_ms = data.get("play_at_ms")
             if not rtp_url:
                 return
             wall_key = f"rtp_{rtp_url}_{json.dumps(crop, sort_keys=True)}"
             if wall_key == self._ndi_active_key:
-                # Same stream — only skip if mpv is actually playing.
-                # If mpv is idle (blank screen), the first attempt failed so retry.
+                # Same stream — only skip if mpv is actually playing
                 try:
                     if not self.mpv._mpv["core-idle"]:
-                        log.debug("[WALL RTP] Same RTP wall active and playing — skip")
+                        log.debug("[WALL STREAM] Same stream active and playing — skip")
                         return
-                    log.info("[WALL RTP] Same key but mpv idle — retrying stream")
+                    log.info("[WALL STREAM] Same key but mpv idle — retrying")
                 except Exception:
                     return
-            # Cancel any previous wall task BEFORE starting the new one —
-            # this prevents the old task's retry/sleep from stomping on us.
             self._cancel_wall_rtp_task()
             self._ndi_active_key = wall_key
-            log.info(f"[WALL RTP] {rtp_url} crop={crop} play_at_ms={play_at_ms}")
+            log.info(f"[WALL STREAM] {rtp_url} crop={crop}")
             self._wall_rtp_task = asyncio.create_task(
-                self._play_wall_rtp(rtp_url, crop, play_at_ms=play_at_ms)
+                self._play_wall_rtp(rtp_url, crop)
             )
-
-        elif cmd == "load_wall_playlist":
-            # Wall playlist — fetch playlist and cycle items with crop applied
-            playlist_id = data.get("wall_playlist_id")
-            crop = data.get("wall_crop")
-            if not playlist_id:
-                return
-            wall_key = f"playlist_{playlist_id}_{json.dumps(crop, sort_keys=True)}"
-            if wall_key == self._ndi_active_key:
-                try:
-                    if not self.mpv._mpv["core-idle"]:
-                        log.debug("[WALL PLAYLIST] Same wall playlist active and playing — skip")
-                        return
-                    log.info("[WALL PLAYLIST] Same key but mpv idle — retrying")
-                except Exception:
-                    return
-            self._cancel_wall_rtp_task()
-            self._ndi_active_key = wall_key
-            self._wall_crop = crop
-            log.info(f"[WALL PLAYLIST] playlist={playlist_id} crop={crop}")
-            asyncio.create_task(self._fetch_playlist_by_id(playlist_id))
 
         elif cmd == "restart_service":
             log.info("[RESTART] Restarting signage-player service...")
