@@ -660,6 +660,7 @@ class Player:
         self._ndi_receiver: Optional[object] = None
         self._ndi_sender: Optional[object] = None
         self._ndi_active_key: Optional[str] = None  # dedup key for wall commands
+        self._wall_rtp_task: Optional[asyncio.Task] = None  # current wall stream task (cancellable)
 
         # Local API server (so CMS can proxy NDI sources, preview, etc.)
         self._local_api = LocalApiServer()
@@ -1220,54 +1221,57 @@ class Player:
         log.info(f"[WALL RTP] Opening {rtp_url} vf={vf!r} sync_at={play_at_ms}")
         self._cancel_duration_timer()
         self.mpv.cmd_stop()
-        # Allow mpv to fully stop before opening the UDP socket
-        await asyncio.sleep(0.5)
 
-        # Set UDP/network-friendly demuxer options so mpv probes quickly
-        # instead of waiting for 5 MB of data (the default).
-        # MPEG-TS is self-describing so a small probe is sufficient.
-        for _k, _v in {
-            "demuxer-lavf-probesize": 131072,  # 128 KB instead of 5 MB default
-            "demuxer-lavf-analyzeduration": 0.5,  # 0.5 s instead of 5 s default
-            "cache": "yes",
-            "cache-secs": 3,
-        }.items():
-            try:
-                self.mpv._mpv[_k] = _v
-            except Exception:
-                pass
+        try:
+            # Allow mpv to fully stop before opening the UDP socket
+            await asyncio.sleep(0.5)
 
-        if play_at_ms:
-            now_ms = int(time.time() * 1000)
-            delay_ms = play_at_ms - now_ms
-            if delay_ms > 100:
-                # Start buffering immediately (paused), then release at the sync moment
-                self.mpv.play_file(rtp_url, loop=False, vf=vf, start_paused=True)
-                log.info(f"[WALL RTP] Buffering — synchronized start in {delay_ms}ms")
-                await asyncio.sleep(delay_ms / 1000.0)
+            # Set UDP/network-friendly demuxer options so mpv probes quickly
+            # instead of waiting for 5 MB of data (the default).
+            # MPEG-TS is self-describing so a small probe is sufficient.
+            for _k, _v in {
+                "demuxer-lavf-probesize": 131072,  # 128 KB instead of 5 MB default
+                "demuxer-lavf-analyzeduration": 0.5,  # 0.5 s instead of 5 s default
+                "cache": "yes",
+                "cache-secs": 3,
+            }.items():
                 try:
-                    self.mpv._mpv.pause = False
+                    self.mpv._mpv[_k] = _v
                 except Exception:
                     pass
-                log.info("[WALL RTP] Synchronized start — unpaused")
-                # Fall through to the blank-screen retry check below
-            else:
-                self.mpv.play_file(rtp_url, loop=False, vf=vf)
-        else:
-            # No sync timestamp (or in the past) — play immediately
-            self.mpv.play_file(rtp_url, loop=False, vf=vf)
 
-        # Blank-screen guard: if mpv is still idle 4 seconds after we told it to
-        # play, the stream wasn't available yet (ffmpeg still starting, or a
-        # network hiccup). Retry once — the stream will be on the wire by now.
-        await asyncio.sleep(4.0)
-        try:
-            idle = self.mpv._mpv["core-idle"]
-            if idle:
-                log.warning("[WALL RTP] Stream appears blank — retrying now")
+            if play_at_ms:
+                now_ms = int(time.time() * 1000)
+                delay_ms = play_at_ms - now_ms
+                if delay_ms > 100:
+                    # Start buffering immediately (paused), then release at the sync moment
+                    self.mpv.play_file(rtp_url, loop=False, vf=vf, start_paused=True)
+                    log.info(f"[WALL RTP] Buffering — synchronized start in {delay_ms}ms")
+                    await asyncio.sleep(delay_ms / 1000.0)
+                    try:
+                        self.mpv._mpv.pause = False
+                    except Exception:
+                        pass
+                    log.info("[WALL RTP] Synchronized start — unpaused")
+                else:
+                    self.mpv.play_file(rtp_url, loop=False, vf=vf)
+            else:
+                # No sync timestamp (or in the past) — play immediately
                 self.mpv.play_file(rtp_url, loop=False, vf=vf)
-        except Exception:
-            pass
+
+            # Blank-screen guard: if mpv is still idle 4 seconds after play,
+            # the stream wasn't available yet. Retry once.
+            await asyncio.sleep(4.0)
+            try:
+                idle = self.mpv._mpv["core-idle"]
+                if idle:
+                    log.warning("[WALL RTP] Stream appears blank — retrying now")
+                    self.mpv.play_file(rtp_url, loop=False, vf=vf)
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            log.info("[WALL RTP] Task cancelled (switching to new content)")
+            return
 
     async def _duration_then_advance(self, seconds: float) -> None:
         try:
@@ -1282,6 +1286,14 @@ class Player:
             return
         next_index = (self._current_index + 1) % len(self._playlist_items)
         await self._play_index(next_index)
+
+    def _cancel_wall_rtp_task(self) -> None:
+        """Cancel any running _play_wall_rtp task so its retry/sleep can't
+        stomp on the new playback command."""
+        if self._wall_rtp_task and not self._wall_rtp_task.done():
+            self._wall_rtp_task.cancel()
+            log.debug("[WALL RTP] Cancelled previous wall task")
+        self._wall_rtp_task = None
 
     def _cancel_duration_timer(self) -> None:
         if self._duration_timer and not self._duration_timer.done():
@@ -1394,7 +1406,18 @@ class Player:
                 self.last_playlist_hash = incoming_hash or None
                 self.last_content_id = None
                 self._ndi_active_key = None  # exit wall mode
+                self._cancel_wall_rtp_task()
                 asyncio.create_task(self._fetch_playlist())
+
+        elif cmd == "stop_wall":
+            # Server tells us to exit wall mode — stop stream and revert to playlist
+            log.info("[WALL] Received stop_wall — exiting wall mode")
+            self._ndi_active_key = None
+            self._cancel_wall_rtp_task()
+            self.mpv.cmd_stop()
+            # Resume individual playlist if we have one
+            if self._playlist_items:
+                asyncio.create_task(self._play_index(self._current_index))
 
         elif cmd == "load_content":
             content_id = data.get("content_id")
@@ -1406,6 +1429,7 @@ class Player:
                 self.last_content_id = content_id
                 self.last_playlist_hash = None
                 self._ndi_active_key = None  # exit wall mode
+                self._cancel_wall_rtp_task()
                 log.info(f"Loading direct content: {content_id}")
                 asyncio.create_task(self._load_single_content(content_id))
 
@@ -1482,6 +1506,7 @@ class Player:
             if wall_key == self._ndi_active_key:
                 log.debug("[WALL] Same image wall already active — skip")
                 return
+            self._cancel_wall_rtp_task()
             self._ndi_active_key = wall_key
             log.info(f"[WALL] Image wall: content={content_id} crop={crop}")
             asyncio.create_task(self._load_wall_content(content_id, crop))
@@ -1504,9 +1529,14 @@ class Player:
                     log.info("[WALL RTP] Same key but mpv idle — retrying stream")
                 except Exception:
                     return
+            # Cancel any previous wall task BEFORE starting the new one —
+            # this prevents the old task's retry/sleep from stomping on us.
+            self._cancel_wall_rtp_task()
             self._ndi_active_key = wall_key
             log.info(f"[WALL RTP] {rtp_url} crop={crop} play_at_ms={play_at_ms}")
-            asyncio.create_task(self._play_wall_rtp(rtp_url, crop, play_at_ms=play_at_ms))
+            self._wall_rtp_task = asyncio.create_task(
+                self._play_wall_rtp(rtp_url, crop, play_at_ms=play_at_ms)
+            )
 
         elif cmd == "start_ndi_broadcast":
             if self._ndi_sender:
