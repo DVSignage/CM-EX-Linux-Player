@@ -1176,54 +1176,42 @@ class Player:
     # ------------------------------------------------------------------
 
     async def _play_wall_rtp(self, rtp_url: str, crop: Optional[dict]) -> None:
-        """Video wall: open the server-side multicast stream and crop this player's region.
+        """Video wall: open a pre-cropped RTSP tile stream from the server.
 
-        The server streams everything (video, images, playlists) via ffmpeg.
-        This player just opens the URL and applies the crop filter.
+        The server does all the cropping — each player gets its own tile at
+        native resolution via RTSP/TCP. No client-side filter needed.
 
-        After opening, monitors mpv — if it goes idle (stream died because
-        server restarted ffmpeg), clears the dedup key so the next heartbeat
-        automatically re-opens the stream. Self-healing, no manual restart needed.
+        Monitors mpv — if it goes idle (server restarted ffmpeg for content
+        switch), clears the dedup key so the next heartbeat re-opens.
         """
-        vf = _build_crop_filter(crop)
-        log.info(f"[WALL STREAM] Opening {rtp_url} vf={vf!r}")
+        log.info(f"[WALL STREAM] Opening {rtp_url}")
         self._cancel_duration_timer()
         self.mpv.cmd_stop()
 
         try:
             await asyncio.sleep(0.3)
 
-            # Tune mpv for low-latency wall streaming
+            # Tune mpv for low-latency RTSP
             for _k, _v in {
-                # Demuxer: fast probe for MPEG-TS
-                "demuxer-lavf-probesize": 131072,       # 128 KB (3.2: keep)
-                "demuxer-lavf-analyzeduration": 0.5,    # 0.5s (3.3: keep)
-                # Cache: minimal — server handles buffering
-                "cache": "no",                          # 3.1: no client cache
-                # Low-latency profile
-                "profile": "low-latency",               # 3.4: audio-buffer=0, untimed, etc.
-                "video-sync": "audio",                  # 3.5: no display-resample buffer
-                "audio-buffer": 0,                      # 3.6: zero audio buffer
-                # Wall mode: don't hold last frame on stream end
-                "keep-open": "no",                      # 3.8: clean transitions
+                "demuxer-lavf-probesize": 65536,
+                "demuxer-lavf-analyzeduration": 0.5,
+                "cache": "no",
+                "profile": "low-latency",
+                "video-sync": "desync",
+                "audio": "no",
+                "audio-buffer": 0,
+                "keep-open": "no",
+                "rtsp-transport": "tcp",
             }.items():
                 try:
                     self.mpv._mpv[_k] = _v
                 except Exception:
                     pass
 
-            # 3.7: Add UDP buffer params for reliable reception
-            stream_url = rtp_url
-            if "?" in stream_url:
-                stream_url += "&buffer_size=16777216&fifo_size=50000000&overrun_nonfatal=1"
-            else:
-                stream_url += "?buffer_size=16777216&fifo_size=50000000&overrun_nonfatal=1"
+            # No vf — tile is already pre-cropped at the server
+            self.mpv.play_file(rtp_url, loop=False, vf=None)
 
-            self.mpv.play_file(stream_url, loop=False, vf=vf)
-
-            # Monitor for stream death: if mpv goes idle while we're supposed
-            # to be playing, the stream died (server restarted ffmpeg).
-            # Clear the dedup key so the next heartbeat re-opens the stream.
+            # Monitor for stream death
             await asyncio.sleep(5)
             while True:
                 await asyncio.sleep(2)
@@ -1231,7 +1219,6 @@ class Player:
                     if self.mpv._mpv["core-idle"]:
                         log.warning("[WALL STREAM] Stream died — clearing key for auto-recovery")
                         self._ndi_active_key = None
-                        # Restore keep-open for normal playlist playback
                         try:
                             self.mpv._mpv["keep-open"] = "always"
                         except Exception:
@@ -1241,7 +1228,6 @@ class Player:
                     return
         except asyncio.CancelledError:
             log.info("[WALL STREAM] Task cancelled (switching content)")
-            # Restore keep-open for normal playlist playback
             try:
                 self.mpv._mpv["keep-open"] = "always"
             except Exception:
@@ -1479,14 +1465,12 @@ class Player:
                     self._ndi_receiver.start(source_name, crop=ndi_crop)
 
         elif cmd == "load_wall_rtp":
-            # Wall stream — server streams all content types via ffmpeg multicast
+            # Wall stream — pre-cropped RTSP tile from server
             rtp_url = data.get("rtp_url")
-            crop = data.get("wall_crop")
             if not rtp_url:
                 return
-            wall_key = f"rtp_{rtp_url}_{json.dumps(crop, sort_keys=True)}"
+            wall_key = f"rtp_{rtp_url}"
             if wall_key == self._ndi_active_key:
-                # Same stream — only skip if mpv is actually playing
                 try:
                     if not self.mpv._mpv["core-idle"]:
                         log.debug("[WALL STREAM] Same stream active and playing — skip")
@@ -1496,9 +1480,9 @@ class Player:
                     return
             self._cancel_wall_rtp_task()
             self._ndi_active_key = wall_key
-            log.info(f"[WALL STREAM] {rtp_url} crop={crop}")
+            log.info(f"[WALL STREAM] {rtp_url}")
             self._wall_rtp_task = asyncio.create_task(
-                self._play_wall_rtp(rtp_url, crop)
+                self._play_wall_rtp(rtp_url, None)
             )
 
         elif cmd == "restart_service":
