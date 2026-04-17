@@ -634,6 +634,9 @@ class Player:
         self.last_content_id: Optional[str] = None
         self.boot_cache_loaded: bool = False
 
+        # Wall playlist mode: when set, _play_index applies this crop to every item
+        self._wall_crop: Optional[dict] = None
+
         # Current playlist state
         self._playlist_items: list = []   # list of {path, duration, filename}
         self._current_index: int = -1
@@ -850,6 +853,28 @@ class Player:
                     await self._process_and_download_playlist(offline_data)
                 except Exception as e2:
                     log.error(f"Failed to parse offline playlist: {e2}")
+
+    # ------------------------------------------------------------------
+    # Fetch playlist by ID (for wall playlist mode)
+    # ------------------------------------------------------------------
+
+    async def _fetch_playlist_by_id(self, playlist_id: str) -> None:
+        """Fetch a specific playlist from the CMS and play it.
+        Used by wall playlist mode — the _wall_crop is already set before calling this."""
+        try:
+            log.info(f"[WALL PLAYLIST] Fetching playlist {playlist_id}...")
+            r = await self._http_client().get(
+                f"{self.cms_url}/api/v1/playlists/{playlist_id}"
+            )
+            r.raise_for_status()
+            playlist_data = r.json()
+            if not playlist_data or not playlist_data.get("items"):
+                log.warning("[WALL PLAYLIST] Playlist is empty")
+                return
+            log.info(f"[WALL PLAYLIST] Processing {len(playlist_data['items'])} items with wall crop")
+            await self._process_and_download_playlist(playlist_data)
+        except Exception as e:
+            log.error(f"[WALL PLAYLIST] Failed to fetch playlist {playlist_id}: {e}")
 
     # ------------------------------------------------------------------
     # Load single content item (load_content command)
@@ -1090,11 +1115,14 @@ class Player:
         single_item = len(self._playlist_items) == 1
         use_loop = single_item and not is_img and duration == 0
 
+        # When in wall playlist mode, apply the crop filter to every item
+        vf = _build_crop_filter(self._wall_crop) if self._wall_crop else None
+
         log.info(
             f"Playing [{index+1}/{len(self._playlist_items)}] "
-            f"{filename}  (duration={duration}, loop={use_loop})"
+            f"{filename}  (duration={duration}, loop={use_loop}{', wall_crop' if vf else ''})"
         )
-        self.mpv.play_file(str(path), loop=use_loop)
+        self.mpv.play_file(str(path), loop=use_loop, vf=vf)
 
         if is_img:
             # Images: always use a timer (default 10 s if duration == 0)
@@ -1406,6 +1434,7 @@ class Player:
                 self.last_playlist_hash = incoming_hash or None
                 self.last_content_id = None
                 self._ndi_active_key = None  # exit wall mode
+                self._wall_crop = None
                 self._cancel_wall_rtp_task()
                 asyncio.create_task(self._fetch_playlist())
 
@@ -1413,6 +1442,7 @@ class Player:
             # Server tells us to exit wall mode — stop stream and revert to playlist
             log.info("[WALL] Received stop_wall — exiting wall mode")
             self._ndi_active_key = None
+            self._wall_crop = None
             self._cancel_wall_rtp_task()
             self.mpv.cmd_stop()
             # Resume individual playlist if we have one
@@ -1537,6 +1567,36 @@ class Player:
             self._wall_rtp_task = asyncio.create_task(
                 self._play_wall_rtp(rtp_url, crop, play_at_ms=play_at_ms)
             )
+
+        elif cmd == "load_wall_playlist":
+            # Wall playlist — fetch playlist and cycle items with crop applied
+            playlist_id = data.get("wall_playlist_id")
+            crop = data.get("wall_crop")
+            if not playlist_id:
+                return
+            wall_key = f"playlist_{playlist_id}_{json.dumps(crop, sort_keys=True)}"
+            if wall_key == self._ndi_active_key:
+                try:
+                    if not self.mpv._mpv["core-idle"]:
+                        log.debug("[WALL PLAYLIST] Same wall playlist active and playing — skip")
+                        return
+                    log.info("[WALL PLAYLIST] Same key but mpv idle — retrying")
+                except Exception:
+                    return
+            self._cancel_wall_rtp_task()
+            self._ndi_active_key = wall_key
+            self._wall_crop = crop
+            log.info(f"[WALL PLAYLIST] playlist={playlist_id} crop={crop}")
+            asyncio.create_task(self._fetch_playlist_by_id(playlist_id))
+
+        elif cmd == "restart_service":
+            log.info("[RESTART] Restarting signage-player service...")
+            subprocess.Popen(
+                ["sudo", "systemctl", "restart", "signage-player"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return  # systemd will kill this process
 
         elif cmd == "start_ndi_broadcast":
             if self._ndi_sender:
