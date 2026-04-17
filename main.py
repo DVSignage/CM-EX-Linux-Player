@@ -1179,8 +1179,11 @@ class Player:
         """Video wall: open the server-side multicast stream and crop this player's region.
 
         The server streams everything (video, images, playlists) via ffmpeg.
-        This player just opens the URL and applies the crop filter. No downloads,
-        no sync timestamps, no retry loops — the stream is always on the wire.
+        This player just opens the URL and applies the crop filter.
+
+        After opening, monitors mpv — if it goes idle (stream died because
+        server restarted ffmpeg), clears the dedup key so the next heartbeat
+        automatically re-opens the stream. Self-healing, no manual restart needed.
         """
         vf = _build_crop_filter(crop)
         log.info(f"[WALL STREAM] Opening {rtp_url} vf={vf!r}")
@@ -1203,6 +1206,20 @@ class Player:
                     pass
 
             self.mpv.play_file(rtp_url, loop=False, vf=vf)
+
+            # Monitor for stream death: if mpv goes idle while we're supposed
+            # to be playing, the stream died (server restarted ffmpeg).
+            # Clear the dedup key so the next heartbeat re-opens the stream.
+            await asyncio.sleep(5)
+            while True:
+                await asyncio.sleep(2)
+                try:
+                    if self.mpv._mpv["core-idle"]:
+                        log.warning("[WALL STREAM] Stream died — clearing key for auto-recovery")
+                        self._ndi_active_key = None
+                        return
+                except Exception:
+                    return
         except asyncio.CancelledError:
             log.info("[WALL STREAM] Task cancelled (switching content)")
             return
