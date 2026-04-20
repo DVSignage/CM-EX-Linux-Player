@@ -416,6 +416,81 @@ def _build_crop_filter(crop: Optional[dict]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Wall tile download (frame-accurate hybrid path)
+# ---------------------------------------------------------------------------
+
+_TILE_CACHE_DIR = Path.home() / ".cache" / "signage-player" / "wall-tiles"
+
+
+def _download_tile_with_etag(url: str) -> Optional[Path]:
+    """Download a wall tile MP4 to local cache, using ETag/Last-Modified for
+    304-conditional requests. Returns the local Path or None on failure.
+
+    Runs synchronously — call via run_in_executor from async contexts.
+    """
+    import urllib.request
+    import urllib.error
+    import hashlib as _hl
+
+    _TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # Deterministic filename per URL
+    name = _hl.md5(url.encode()).hexdigest()[:16] + ".mp4"
+    local_path = _TILE_CACHE_DIR / name
+    etag_path = local_path.with_suffix(".etag")
+
+    req = urllib.request.Request(url)
+    # Attach cached validators
+    if local_path.exists() and etag_path.exists():
+        try:
+            etag_val = etag_path.read_text().strip()
+            if etag_val:
+                req.add_header("If-None-Match", etag_val)
+        except Exception:
+            pass
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            new_etag = resp.headers.get("ETag", "")
+            tmp = local_path.with_suffix(".mp4.tmp")
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            tmp.replace(local_path)
+            if new_etag:
+                etag_path.write_text(new_etag)
+            log.info(f"[TILE] Downloaded {url} → {local_path.name}")
+            return local_path
+    except urllib.error.HTTPError as e:
+        if e.code == 304 and local_path.exists():
+            log.debug(f"[TILE] 304 not-modified, using cached {local_path.name}")
+            return local_path
+        log.error(f"[TILE] HTTP {e.code} fetching {url}: {e}")
+    except Exception as e:
+        log.error(f"[TILE] Failed to fetch {url}: {e}")
+        # If download failed but we have a cached copy, use it
+        if local_path.exists():
+            log.info(f"[TILE] Falling back to cached {local_path.name}")
+            return local_path
+    return None
+
+
+def _ffprobe_duration(path: Path) -> float:
+    """Return duration in seconds, or 0 on failure."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
 # Cache helpers
 # ---------------------------------------------------------------------------
 
@@ -664,6 +739,14 @@ class Player:
         self._ndi_sender: Optional[object] = None
         self._ndi_active_key: Optional[str] = None  # dedup key for wall commands
         self._wall_rtp_task: Optional[asyncio.Task] = None  # current wall stream task (cancellable)
+
+        # Hybrid frame-accurate local-file path
+        self._sync_correction_task: Optional[asyncio.Task] = None
+        self._sync_anchor_ms: Optional[int] = None       # play_at_ms from server
+        self._sync_duration_s: float = 0.0               # loop duration of the tile MP4
+        self._sync_active: bool = False
+        self._tile_duration_cache: dict = {}             # {path: duration}
+        self._wall_local_path: Optional[Path] = None
 
         # Local API server (so CMS can proxy NDI sources, preview, etc.)
         self._local_api = LocalApiServer()
@@ -1234,6 +1317,229 @@ class Player:
                 pass
             return
 
+    # ------------------------------------------------------------------
+    # Frame-accurate local-file playback (hybrid path)
+    # ------------------------------------------------------------------
+
+    async def _play_wall_localfile(self, url: str,
+                                    play_at_ms: Optional[int],
+                                    loop_duration_s: float = 0.0) -> None:
+        """Wall stream — HTTP-served local-file playback with sync correction.
+
+        Flow:
+          1. Download (with ETag/mtime cache) the per-tile MP4
+          2. Probe duration if not provided by server
+          3. Compute expected_pts = (now - play_at_ms) % duration
+          4. mpv play_file with loop=True, start_paused=True
+          5. Wait until target unpause wall-clock, unpause
+          6. Arm sync-correction loop to keep all players on the same frame
+        """
+        log.info(f"[WALL LOCAL] {url}  play_at_ms={play_at_ms}")
+        self._cancel_duration_timer()
+
+        try:
+            # 1) DOWNLOAD (off the asyncio loop)
+            local_path = await self._loop.run_in_executor(
+                None, _download_tile_with_etag, url
+            )
+            if local_path is None or not local_path.exists():
+                log.error("[WALL LOCAL] download failed, aborting this push")
+                return
+
+            # 2) DURATION — prefer server value, fall back to ffprobe cache
+            duration_s = float(loop_duration_s) if loop_duration_s > 0 else 0.0
+            if duration_s <= 0:
+                duration_s = self._tile_duration_cache.get(str(local_path), 0.0)
+            if duration_s <= 0:
+                duration_s = await self._loop.run_in_executor(
+                    None, _ffprobe_duration, local_path
+                )
+                if duration_s > 0:
+                    self._tile_duration_cache[str(local_path)] = duration_s
+
+            if duration_s <= 0:
+                log.warning(f"[WALL LOCAL] could not determine duration of {local_path.name}")
+
+            # 3) Apply low-latency local-playback mpv options
+            for _k, _v in {
+                "video-sync": "desync",        # use system clock, not display refresh
+                "interpolation": False,
+                "framedrop": "no",
+                "hwdec": "auto-safe",
+                "audio": "no",
+                "keep-open": "always",
+                "loop-file": "inf",
+                "cache": "no",
+            }.items():
+                try:
+                    self.mpv._mpv[_k] = _v
+                except Exception:
+                    pass
+
+            # 4) Compute target unpause wall-clock + expected pts
+            now_ms = int(time.time() * 1000)
+            if play_at_ms and duration_s > 0:
+                # Unpause 1.5s from now (or at play_at_ms if that's in the future)
+                target_unpause_ms = play_at_ms if play_at_ms > now_ms + 200 else now_ms + 1500
+                expected_pts = ((target_unpause_ms - play_at_ms) / 1000.0) % duration_s
+                if expected_pts < 0:
+                    expected_pts += duration_s
+            else:
+                target_unpause_ms = now_ms + 500
+                expected_pts = 0.0
+
+            # Pause BEFORE loading so first frame lands on the right PTS
+            try:
+                self.mpv._mpv["pause"] = True
+            except Exception:
+                pass
+
+            log.info(
+                f"[WALL LOCAL] play_file paused {local_path.name} "
+                f"(duration={duration_s:.2f}s, unpause in "
+                f"{target_unpause_ms - now_ms}ms, expected_pts={expected_pts:.2f}s)"
+            )
+            self.mpv.play_file(str(local_path), loop=True, vf=None,
+                                start_paused=True)
+
+            # 5a) Wait for first frame decoded
+            ff_deadline_ms = target_unpause_ms - 100
+            while int(time.time() * 1000) < ff_deadline_ms:
+                pt = getattr(self.mpv._mpv, "playback_time", None)
+                if pt is not None and pt >= 0:
+                    break
+                await asyncio.sleep(0.01)
+
+            # 5b) Defensive re-pause
+            try:
+                self.mpv._mpv["pause"] = True
+            except Exception:
+                pass
+
+            # 5c) Wait until target unpause wall-clock
+            wait_s = (target_unpause_ms - int(time.time() * 1000)) / 1000.0
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+
+            # 6) Unpause synchronously
+            try:
+                self.mpv._mpv["pause"] = False
+            except Exception:
+                pass
+            drift = int(time.time() * 1000) - target_unpause_ms
+            log.info(f"[WALL LOCAL] UNPAUSED drift={drift:+d}ms")
+
+            # 7) Arm the sync-correction loop
+            self._sync_anchor_ms = play_at_ms
+            self._sync_duration_s = duration_s
+            self._wall_local_path = local_path
+            self._sync_active = (play_at_ms is not None and duration_s > 0)
+            if self._sync_active:
+                self._sync_correction_task = asyncio.create_task(
+                    self._sync_correction_loop()
+                )
+
+            # Idle watchdog (same as RTSP — auto-recover if mpv dies)
+            await asyncio.sleep(5)
+            while True:
+                await asyncio.sleep(2)
+                try:
+                    if self.mpv._mpv["core-idle"]:
+                        log.warning("[WALL LOCAL] mpv idle — clearing key for recovery")
+                        self._ndi_active_key = None
+                        return
+                except Exception:
+                    return
+        except asyncio.CancelledError:
+            log.info("[WALL LOCAL] task cancelled (switching content)")
+            self._sync_active = False
+            return
+
+    async def _sync_correction_loop(self) -> None:
+        """Soft sync correction for local-file playback.
+
+        Periodically compares actual playback_time against expected_pts
+        (derived from wall-clock + sync anchor + loop duration). Nudges
+        playback speed for small drifts, micro-seeks for medium, hard
+        seeks for large. NTP-synced player clocks make this accurate to
+        a few ms across a fleet."""
+        SYNC_PERIOD_S = 1.0
+        DEAD_BAND_MS = 20         # < ±20ms: ignore
+        MICRO_SEEK_MS = 100       # 20-100ms: speed nudge; 100-500ms: micro seek
+        HARD_MS = 500             # > 500ms: hard seek
+        SPEED_GAIN_S = 1.0
+        SPEED_CLAMP = 0.10
+
+        log.info("[SYNC] correction loop started")
+        try:
+            await asyncio.sleep(2.0)
+            while True:
+                await asyncio.sleep(SYNC_PERIOD_S)
+                if not self._sync_active or not self._sync_anchor_ms:
+                    continue
+                D = float(self._sync_duration_s)
+                if D <= 0:
+                    continue
+                actual_pts = getattr(self.mpv._mpv, "playback_time", None)
+                if actual_pts is None or actual_pts < 0:
+                    continue
+
+                now_ms = int(time.time() * 1000)
+                elapsed_s = (now_ms - self._sync_anchor_ms) / 1000.0
+                expected_pts = elapsed_s % D
+                if expected_pts < 0:
+                    expected_pts += D
+
+                drift_s = expected_pts - actual_pts
+                # Wrap modulo loop length
+                if drift_s > D / 2:
+                    drift_s -= D
+                if drift_s < -D / 2:
+                    drift_s += D
+                drift_ms = drift_s * 1000.0
+
+                if abs(drift_ms) <= DEAD_BAND_MS:
+                    try:
+                        self.mpv._mpv.command_async("set_property", "speed", 1.0)
+                    except Exception:
+                        pass
+                    continue
+
+                if abs(drift_ms) > HARD_MS:
+                    log.warning(f"[SYNC] HARD SEEK drift={drift_ms:+.0f}ms → "
+                                f"expected={expected_pts:.2f}s")
+                    try:
+                        self.mpv._mpv.seek(expected_pts, "absolute")
+                        self.mpv._mpv.command_async("set_property", "speed", 1.0)
+                    except Exception as e:
+                        log.warning(f"[SYNC] hard seek failed: {e}")
+                    continue
+
+                if abs(drift_ms) > MICRO_SEEK_MS:
+                    log.info(f"[SYNC] MICRO SEEK drift={drift_ms:+.0f}ms")
+                    try:
+                        self.mpv._mpv.seek(expected_pts, "absolute")
+                        self.mpv._mpv.command_async("set_property", "speed", 1.0)
+                    except Exception as e:
+                        log.warning(f"[SYNC] micro seek failed: {e}")
+                    continue
+
+                # Soft speed nudge for small drifts
+                ratio = 1.0 + drift_s / SPEED_GAIN_S
+                ratio = max(1.0 - SPEED_CLAMP, min(1.0 + SPEED_CLAMP, ratio))
+                log.info(f"[SYNC] soft drift={drift_ms:+.0f}ms speed={ratio:.4f}")
+                try:
+                    self.mpv._mpv.command_async("set_property", "speed", ratio)
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            try:
+                self.mpv._mpv.command_async("set_property", "speed", 1.0)
+            except Exception:
+                pass
+            log.info("[SYNC] correction loop cancelled")
+            return
+
     async def _duration_then_advance(self, seconds: float) -> None:
         try:
             await asyncio.sleep(seconds)
@@ -1249,12 +1555,17 @@ class Player:
         await self._play_index(next_index)
 
     def _cancel_wall_rtp_task(self) -> None:
-        """Cancel any running _play_wall_rtp task so its retry/sleep can't
-        stomp on the new playback command."""
+        """Cancel any running wall task (RTSP or local-file) and the
+        frame-accurate sync-correction loop."""
         if self._wall_rtp_task and not self._wall_rtp_task.done():
             self._wall_rtp_task.cancel()
-            log.debug("[WALL RTP] Cancelled previous wall task")
+            log.debug("[WALL] Cancelled previous wall task")
         self._wall_rtp_task = None
+        if self._sync_correction_task and not self._sync_correction_task.done():
+            self._sync_correction_task.cancel()
+            log.debug("[WALL] Cancelled sync-correction task")
+        self._sync_correction_task = None
+        self._sync_active = False
 
     def _cancel_duration_timer(self) -> None:
         if self._duration_timer and not self._duration_timer.done():
@@ -1465,25 +1776,45 @@ class Player:
                     self._ndi_receiver.start(source_name, crop=ndi_crop)
 
         elif cmd == "load_wall_rtp":
-            # Wall stream — pre-cropped RTSP tile from server
+            # Unified wall load — dispatch on URL scheme:
+            #   rtsp://…   → live RTSP (_play_wall_rtp)
+            #   http(s)://… → pre-rendered local file (_play_wall_localfile)
             rtp_url = data.get("rtp_url")
             if not rtp_url:
                 return
-            wall_key = f"rtp_{rtp_url}"
+            mode = (data.get("mode") or "").lower()
+            if not mode:
+                # Legacy fallback: detect from URL scheme
+                mode = "localfile" if rtp_url.startswith(("http://", "https://")) else "rtsp"
+
+            play_at_ms = data.get("play_at_ms")
+            loop_duration_s = data.get("loop_duration_s") or 0.0
+
+            # Dedup key includes mode + sync anchor so a re-push with the same
+            # URL but fresh play_at_ms still re-anchors sync
+            wall_key = f"{mode}_{rtp_url}_{play_at_ms or 0}"
             if wall_key == self._ndi_active_key:
                 try:
                     if not self.mpv._mpv["core-idle"]:
-                        log.debug("[WALL STREAM] Same stream active and playing — skip")
+                        log.debug(f"[WALL {mode.upper()}] Same stream active — skip")
                         return
-                    log.info("[WALL STREAM] Same key but mpv idle — retrying")
+                    log.info(f"[WALL {mode.upper()}] Same key but mpv idle — retrying")
                 except Exception:
                     return
+
             self._cancel_wall_rtp_task()
             self._ndi_active_key = wall_key
-            log.info(f"[WALL STREAM] {rtp_url}")
-            self._wall_rtp_task = asyncio.create_task(
-                self._play_wall_rtp(rtp_url, None)
-            )
+            log.info(f"[WALL {mode.upper()}] {rtp_url} play_at_ms={play_at_ms} "
+                     f"loop_duration={loop_duration_s}")
+
+            if mode == "localfile":
+                self._wall_rtp_task = asyncio.create_task(
+                    self._play_wall_localfile(rtp_url, play_at_ms, loop_duration_s)
+                )
+            else:
+                self._wall_rtp_task = asyncio.create_task(
+                    self._play_wall_rtp(rtp_url, None)
+                )
 
         elif cmd == "restart_service":
             log.info("[RESTART] Restarting signage-player service...")
