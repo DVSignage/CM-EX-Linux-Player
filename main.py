@@ -1483,6 +1483,13 @@ class Player:
         """
         log.info(f"[WALL STREAM] Opening {rtp_url}  play_at_ms={play_at_ms}")
         self._cancel_duration_timer()
+        # RTSP streams are NOT seekable. The seek-based sync correction loop
+        # only makes sense for HTTP-served local MP4s (the frame-accurate
+        # path). Disarm any leftover sync state from a previous local-file
+        # push so the correction loop doesn't try to seek on this stream.
+        self._sync_active = False
+        self._sync_anchor_ms = None
+        self._sync_duration_s = None
         # NOTE: deliberately NOT calling self.mpv.cmd_stop() here. cmd_stop
         # immediately blanks the screen; we instead let the old frame stay
         # visible during the Phase 1 wait, then mpv's loadfile (called by
@@ -1588,13 +1595,11 @@ class Player:
                     pass
                 t_unpaused_ms = int(time.time() * 1000)
                 log.info(f"[WALL STREAM] UNPAUSED @{t_unpaused_ms} target={play_at_ms} drift={t_unpaused_ms - play_at_ms}ms")
-                # Arm continuous soft-sync correction. Cancels itself if
-                # _cancel_wall_rtp_task is called (= new push).
-                if self._sync_correction_task is None or self._sync_correction_task.done():
-                    self._sync_correction_task = asyncio.create_task(
-                        self._sync_correction_loop()
-                    )
-                    log.info("[WALL STREAM] Soft-sync correction loop armed")
+                # NO sync-correction loop here — RTSP streams are not
+                # seekable, so micro-seek / hard-rescue would 404 forever.
+                # Cross-player sync for RTSP comes entirely from the
+                # synchronised unpause tick above (same wallclock moment
+                # across all players with chrony-synced system clocks).
             else:
                 # No sync tick — immediate transition (still no cmd_stop)
                 self.mpv.play_file(rtp_url, loop=False, vf=None)
