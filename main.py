@@ -15,6 +15,7 @@ Single-file orchestrator that mirrors the Windows player (main.js) behaviour:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -76,6 +77,13 @@ STATE_PATH = CONFIG_DIR / "state.json"
 OFFLINE_PLAYLIST_PATH = CONFIG_DIR / "offline_playlist.json"
 CACHE_DIR = CONFIG_DIR / "cache"
 CACHE_LIMIT_BYTES = 50 * 1024 * 1024 * 1024  # 50 GB
+
+# Per-tile MP4 cache for HTTP-served local-file wall playback.
+# Each downloaded file is keyed by sha256(url)[:16].mp4 with an .etag
+# sidecar; LRU-evicted past TILE_CACHE_MAX_FILES.
+TILE_CACHE_DIR = CONFIG_DIR / "tile_cache"
+TILE_CACHE_ETAG_DIR = TILE_CACHE_DIR / ".etags"
+TILE_CACHE_MAX_FILES = 8
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg"}
 DEFAULT_IMAGE_DURATION = 10  # seconds when duration == 0 for an image
@@ -606,6 +614,100 @@ class LocalApiServer:
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
+
+
+def _tile_cache_key(url: str) -> str:
+    """Stable short key for a tile URL. Same URL across pushes -> same key,
+    so the ETag short-circuit fires and the player avoids re-downloading."""
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+
+
+def _download_tile_with_etag(url: str, timeout: float = 30.0) -> Optional[Path]:
+    """Sync HTTP GET with If-None-Match support. Returns local path on success.
+
+    On 304: returns the existing cached file (no network bytes).
+    On 200: streams to a .part file, atomically renames into place, writes
+            the new ETag sidecar.
+    On error: returns None (caller logs and abandons this push cycle).
+
+    Caller MUST run this in asyncio.to_thread() — it's blocking IO.
+    """
+    import urllib.request, urllib.error
+    TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    TILE_CACHE_ETAG_DIR.mkdir(parents=True, exist_ok=True)
+    key = _tile_cache_key(url)
+    file_path = TILE_CACHE_DIR / f"{key}.mp4"
+    etag_path = TILE_CACHE_ETAG_DIR / f"{key}.etag"
+
+    headers = {}
+    if etag_path.exists() and file_path.exists() and file_path.stat().st_size > 1024:
+        try:
+            headers["If-None-Match"] = etag_path.read_text().strip()
+        except Exception:
+            pass
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            new_etag = resp.headers.get("ETag")
+            tmp = file_path.with_suffix(".mp4.part")
+            n = 0
+            with tmp.open("wb") as f:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    n += len(chunk)
+            tmp.replace(file_path)
+            if new_etag:
+                etag_path.write_text(new_etag)
+            log.info(f"[WALL LOCAL] downloaded {n//1024} KB in {time.time()-t0:.2f}s {file_path.name}")
+    except urllib.error.HTTPError as e:
+        if e.code == 304 and file_path.exists():
+            log.info(f"[WALL LOCAL] cache HIT (304) {file_path.name} ({file_path.stat().st_size//1024} KB)")
+            return file_path
+        log.error(f"[WALL LOCAL] HTTP {e.code} on {url}")
+        return None
+    except Exception as e:
+        log.error(f"[WALL LOCAL] download failed: {e}")
+        return None
+
+    _evict_lru_tile_cache()
+    return file_path
+
+
+def _evict_lru_tile_cache() -> None:
+    """Keep at most TILE_CACHE_MAX_FILES MP4s in the tile cache. Drops oldest
+    by mtime (and the matching .etag sidecar)."""
+    try:
+        files = sorted(TILE_CACHE_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+        for p in files[:-TILE_CACHE_MAX_FILES]:
+            try:
+                p.unlink()
+                etag = TILE_CACHE_ETAG_DIR / (p.stem + ".etag")
+                if etag.exists():
+                    etag.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _ffprobe_duration(path: Path) -> float:
+    """Return container duration in seconds via ffprobe. 0.0 on failure."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        return float(out.stdout.strip()) if out.returncode == 0 else 0.0
+    except Exception:
+        return 0.0
+
+
 class Player:
     """
     Full Linux player that mirrors windows player/main.js behaviour.
@@ -663,7 +765,17 @@ class Player:
         self._ndi_receiver: Optional[object] = None
         self._ndi_sender: Optional[object] = None
         self._ndi_active_key: Optional[str] = None  # dedup key for wall commands
-        self._wall_rtp_task: Optional[asyncio.Task] = None  # current wall stream task (cancellable)
+        self._wall_rtp_task: Optional[asyncio.Task] = None
+        self._sync_correction_task: Optional[asyncio.Task] = None
+        self._wall_stream_started_at_ms: Optional[int] = None
+        self._wall_stream_loop_duration_s: Optional[float] = None  # current wall stream task (cancellable)
+
+        # HTTP-served local-file wall playback state
+        self._tile_duration_cache: dict = {}      # local_path -> duration_s
+        self._sync_anchor_ms: Optional[int] = None    # wall_sync_at_ms of current play
+        self._sync_duration_s: Optional[float] = None  # loop length of current tile file
+        self._sync_active: bool = False               # gate for _sync_correction_loop
+        self._wall_local_path: Optional[Path] = None  # currently-loaded local file
 
         # Local API server (so CMS can proxy NDI sources, preview, etc.)
         self._local_api = LocalApiServer()
@@ -826,6 +938,12 @@ class Player:
     # ------------------------------------------------------------------
     # Fetch playlist
     # ------------------------------------------------------------------
+
+        # Stuck-player recovery watchdog (auto-restart if mpv hangs)
+        try:
+            asyncio.create_task(self._stuck_player_watchdog())
+        except Exception:
+            pass
 
     async def _fetch_playlist(self) -> None:
         """
@@ -1175,55 +1293,313 @@ class Player:
     # Video wall helpers
     # ------------------------------------------------------------------
 
-    async def _play_wall_rtp(self, rtp_url: str, crop: Optional[dict]) -> None:
-        """Video wall: open the server-side multicast stream and crop this player's region.
+    async def _play_wall_local(self, url: str, play_at_ms: Optional[int] = None) -> None:
+        """Wall stream — HTTP-served local-file playback.
 
-        The server streams everything (video, images, playlists) via ffmpeg.
-        This player just opens the URL and applies the crop filter.
-
-        After opening, monitors mpv — if it goes idle (stream died because
-        server restarted ffmpeg), clears the dedup key so the next heartbeat
-        automatically re-opens the stream. Self-healing, no manual restart needed.
+        Pipeline:
+          1. Download (or 304-cache-hit) the per-tile MP4 from server
+          2. Probe duration once, cache it
+          3. Compute expected_pts = (now - wall_sync_at_ms) % duration
+             — same wall_sync_at_ms on every player + chrony-synced clocks
+             = identical expected_pts to within ~6us across all 16 players
+          4. mpv loadfile <local> with start=expected_pts, loop-file=inf,
+             pause=yes
+          5. Wait for first frame decoded AND wall_sync_at_ms wallclock arrival
+          6. command_async unpause (returns in ~50us)
+          7. Arm _sync_correction_loop (seek-based — works on local files)
         """
-        vf = _build_crop_filter(crop)
-        log.info(f"[WALL STREAM] Opening {rtp_url} vf={vf!r}")
+        log.info(f"[WALL LOCAL] {url}  play_at_ms={play_at_ms}")
         self._cancel_duration_timer()
-        self.mpv.cmd_stop()
+
+        # 1) DOWNLOAD (off the asyncio loop) — Python 3.8 compat
+        local_path = await asyncio.get_event_loop().run_in_executor(
+            None, _download_tile_with_etag, url)
+        if local_path is None or not local_path.exists():
+            log.error("[WALL LOCAL] download/cache miss; aborting this push")
+            return
+
+        # 2) DURATION (cached per file)
+        duration_s = self._tile_duration_cache.get(str(local_path))
+        if duration_s is None:
+            duration_s = await asyncio.get_event_loop().run_in_executor(
+                None, _ffprobe_duration, local_path)
+            if duration_s > 0:
+                self._tile_duration_cache[str(local_path)] = duration_s
+        if duration_s <= 0:
+            log.warning(f"[WALL LOCAL] could not determine duration of {local_path.name}; using 0 (no loop sync)")
+            duration_s = 0.0
+
+        # 3) EXPECTED START PTS at the sync moment
+        if play_at_ms:
+            elapsed_ms = int(time.time() * 1000) - play_at_ms
+            if duration_s > 0:
+                expected_pts = (elapsed_ms / 1000.0) % duration_s
+                if expected_pts < 0:
+                    expected_pts += duration_s
+            else:
+                expected_pts = 0.0
+        else:
+            expected_pts = 0.0
+
+        # Apply persistent props for local playback.
+        # video-sync=desync: do NOT lock playback rate to display refresh rate.
+        #   display-resample causes 0.1-0.5% rate variance per physical panel
+        #   (different displays = different actual refresh Hz), which shows up
+        #   as Player-25 consistently 100-300ms ahead of others. desync uses
+        #   the system clock (chrony-synced across all 16) so every player
+        #   advances at the same true rate, eliminating per-display drift.
+        # display-fps-override locks the assumed refresh to a clean 60.0 Hz
+        #   for the display-resample fallback case.
+        local_props = {
+            "video-sync":  "desync",
+            "interpolation": False,
+            "framedrop":   "no",
+            "hwdec":       "auto-safe",
+            "audio":       "no",
+            "keep-open":   "always",
+            "loop-file":   "inf",
+            "cache":       "no",
+            "display-fps-override": 60.0,
+        }
+        for _k, _v in local_props.items():
+            try:
+                self.mpv._mpv[_k] = _v
+            except Exception:
+                pass
 
         try:
-            await asyncio.sleep(0.3)
+            # Compute the target unpause wallclock + expected_pts at THAT moment,
+            # so all players land on the same PTS at the same wallclock.
+            if play_at_ms and duration_s > 0:
+                now_ms = int(time.time() * 1000)
+                target_unpause_ms = play_at_ms if play_at_ms > now_ms + 200 else now_ms + 1500
+                expected_pts_at_unpause = ((target_unpause_ms - play_at_ms) / 1000.0) % duration_s
+                if expected_pts_at_unpause < 0:
+                    expected_pts_at_unpause += duration_s
+            else:
+                target_unpause_ms = int(time.time() * 1000) + 1500
+                expected_pts_at_unpause = 0.0
 
-            # Tune mpv for low-latency wall streaming
-            for _k, _v in {
-                # Demuxer: fast probe for MPEG-TS
-                "demuxer-lavf-probesize": 131072,       # 128 KB (3.2: keep)
-                "demuxer-lavf-analyzeduration": 0.5,    # 0.5s (3.3: keep)
-                # Cache: minimal — server handles buffering
-                "cache": "no",                          # 3.1: no client cache
-                # Low-latency profile
-                "profile": "low-latency",               # 3.4: audio-buffer=0, untimed, etc.
-                "video-sync": "audio",                  # 3.5: no display-resample buffer
-                "audio-buffer": 0,                      # 3.6: zero audio buffer
-                # Wall mode: don't hold last frame on stream end
-                "keep-open": "no",                      # 3.8: clean transitions
-            }.items():
+            # SYNC pause via dict-set (blocks until applied) BEFORE loadfile
+            try:
+                self.mpv._mpv["pause"] = True
+            except Exception:
+                pass
+
+            t_load_ms = int(time.time() * 1000)
+            log.info(f"[WALL LOCAL] play_file start_paused {local_path.name} "
+                     f"(duration={duration_s:.3f}s, unpause in {target_unpause_ms - t_load_ms}ms)")
+            # Use the wrapper's play_file with start_paused=True — the proven
+            # path that handles loop_file/vf/_deliberate_load correctly across
+            # python-mpv binding versions. play_file does NOT call cmd_stop;
+            # combined with keep-open=always, this gives a clean transition
+            # from the previous frame to the new one with no blank flash.
+            try:
+                self.mpv.play_file(str(local_path), loop=True, vf=None,
+                                   start_paused=True)
+            except Exception as e:
+                log.error(f"[WALL LOCAL] play_file failed: {e}")
+                return
+
+            # 5a) BARRIER — wait for first frame decoded (paused at PTS 0)
+            ff_deadline_ms = target_unpause_ms - 100
+            ff_ready_ms = None
+            while int(time.time() * 1000) < ff_deadline_ms:
+                pt = getattr(self.mpv._mpv, "playback_time", None)
+                if pt is not None and pt >= 0:
+                    ff_ready_ms = int(time.time() * 1000)
+                    break
+                await asyncio.sleep(0.01)
+            if ff_ready_ms is None:
+                log.warning(f"[WALL LOCAL] first frame NOT ready by deadline ({int(time.time()*1000) - t_load_ms}ms)")
+            else:
+                log.info(f"[WALL LOCAL] first frame ready @{ff_ready_ms} (load {ff_ready_ms - t_load_ms}ms)")
+
+            # 5b) Defensive re-pause via dict-set (sync). At this point file
+            # is loaded, paused, and at PTS=~0.
+            try:
+                self.mpv._mpv["pause"] = True
+            except Exception:
+                pass
+
+            # 5c) WAIT for unpause wallclock
+            wait_to_play = target_unpause_ms - int(time.time() * 1000)
+            if wait_to_play > 0:
+                await asyncio.sleep(wait_to_play / 1000.0)
+
+            pre_unpause_pts = getattr(self.mpv._mpv, "playback_time", None)
+            # 6) UNPAUSE — sync via dict-set so we KNOW it took effect
+            try:
+                self.mpv._mpv["pause"] = False
+            except Exception:
+                pass
+            t_unpaused_ms = int(time.time() * 1000)
+            log.info(f"[WALL LOCAL] UNPAUSED @{t_unpaused_ms} target={target_unpause_ms} "
+                     f"drift={t_unpaused_ms - target_unpause_ms:+d}ms "
+                     f"pre_unpause_pts={pre_unpause_pts}")
+
+            # 7) Arm the sync-correction loop with this play's anchor + duration
+            self._sync_anchor_ms = play_at_ms
+            self._sync_duration_s = duration_s
+            self._wall_local_path = local_path
+            self._sync_active = (play_at_ms is not None and duration_s > 0)
+            if self._sync_correction_task is None or self._sync_correction_task.done():
+                self._sync_correction_task = asyncio.create_task(self._sync_correction_loop())
+                log.info("[WALL LOCAL] seek-based sync correction loop armed")
+
+            # Idle-watchdog (same as RTSP path — auto-recover if mpv crashed)
+            await asyncio.sleep(5)
+            while True:
+                await asyncio.sleep(2)
+                try:
+                    if self.mpv._mpv["core-idle"]:
+                        log.warning("[WALL LOCAL] mpv idle — clearing key for auto-recovery")
+                        self._ndi_active_key = None
+                        try:
+                            self.mpv._mpv["keep-open"] = "always"
+                        except Exception:
+                            pass
+                        return
+                except Exception:
+                    return
+        except asyncio.CancelledError:
+            log.info("[WALL LOCAL] task cancelled (new push)")
+            self._sync_active = False
+            return
+
+    async def _play_wall_rtp(self, rtp_url: str, crop: Optional[dict],
+                              play_at_ms: Optional[int] = None) -> None:
+        """Video wall: open a pre-cropped RTSP tile stream from the server.
+
+        The server does all the cropping — each player gets its own tile at
+        native resolution via RTSP/TCP. No client-side filter needed.
+
+        If play_at_ms is given, the stream is opened with pause=True and
+        unpaused exactly at that wallclock moment so all 16 players display
+        the same first frame within microseconds of each other (chrony-synced).
+
+        Monitors mpv — if it goes idle (server restarted ffmpeg for content
+        switch), clears the dedup key so the next heartbeat re-opens.
+        """
+        log.info(f"[WALL STREAM] Opening {rtp_url}  play_at_ms={play_at_ms}")
+        self._cancel_duration_timer()
+        # NOTE: deliberately NOT calling self.mpv.cmd_stop() here. cmd_stop
+        # immediately blanks the screen; we instead let the old frame stay
+        # visible during the Phase 1 wait, then mpv's loadfile (called by
+        # play_file) does an old-frame -> new-first-frame transition with
+        # no idle/blank state in between. Combined with keep-open=always
+        # this gives a flash-free Push Live.
+
+        try:
+            # No leading 0.3s sleep — wastes time before Phase 1 wait. Apply
+            # the persistent RTSP tuning props directly.
+            rtsp_props = {
+                "rtsp-transport":              "tcp",
+                "cache":                       "yes",
+                "cache-secs":                  0.5,
+                "demuxer-readahead-secs":      0.5,
+                "demuxer-lavf-probesize":      524288,
+                "demuxer-lavf-analyzeduration": 1000000,
+                "video-sync":                  "display-resample",
+                "interpolation":               False,
+                "framedrop":                   "no",
+                "hwdec":                       "auto-safe",
+                "audio":                       "no",
+                "keep-open":                   "always",
+            }
+            for _k, _v in rtsp_props.items():
                 try:
                     self.mpv._mpv[_k] = _v
                 except Exception:
                     pass
 
-            # 3.7: Add UDP buffer params for reliable reception
-            stream_url = rtp_url
-            if "?" in stream_url:
-                stream_url += "&buffer_size=16777216&fifo_size=50000000&overrun_nonfatal=1"
+            # === 3-phase synchronized open + first-frame-ready barrier ===
+            # Critical fix: between Phase 2 (loadfile) and Phase 3 (unpause)
+            # we BLOCK until mpv has actually decoded a first frame. Without
+            # this, a slow-loading player would unpause mid-load and start
+            # playing from the live stream position when load completed —
+            # which differs per player by hundreds of ms. With the barrier,
+            # every player guarantees "first frame decoded, paused" before
+            # the shared unpause tick, so the unpause flips ALL players from
+            # the same paused frame to the same playing frame.
+            OPEN_BEFORE_PLAY_MS = 800
+            if play_at_ms:
+                # Phase 1 — old frame stays on screen during this wait
+                now_ms = int(time.time() * 1000)
+                open_at_ms = play_at_ms - OPEN_BEFORE_PLAY_MS
+                wait_to_open = open_at_ms - now_ms
+                if wait_to_open > 0:
+                    log.info(f"[WALL STREAM] Phase 1: hold old frame {wait_to_open}ms (until shared OPEN)")
+                    await asyncio.sleep(wait_to_open / 1000.0)
+
+                # Phase 2 — set pause (async, non-blocking), loadfile, BLOCK
+                # until first frame decoded.
+                try:
+                    self.mpv._mpv.command_async("set_property", "pause", True)
+                except Exception:
+                    pass
+                t_p2_start_ms = int(time.time() * 1000)
+                log.info(f"[WALL STREAM] Phase 2: loadfile @{t_p2_start_ms}")
+                self.mpv.play_file(rtp_url, loop=False, vf=None)
+
+                # First-frame-ready barrier — poll until mpv reports a real
+                # playback-time. Time out at play_at_ms - 100ms so we always
+                # leave a small unpause-prep window even if loading dragged.
+                # Defensive re-pause via command_async if mpv slipped into
+                # playing state (would happen if our initial pause=True
+                # property set was processed AFTER the loadfile started).
+                ff_deadline_ms = play_at_ms - 100
+                ff_ready_ms = None
+                while int(time.time() * 1000) < ff_deadline_ms:
+                    try:
+                        pt = self.mpv._mpv["playback-time"]
+                        if pt is not None and pt >= 0:
+                            # File is loaded — defensively re-pause via
+                            # command_async (non-blocking) and break.
+                            try:
+                                self.mpv._mpv.command_async("set_property", "pause", True)
+                            except Exception:
+                                pass
+                            ff_ready_ms = int(time.time() * 1000)
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.02)
+                if ff_ready_ms is None:
+                    log.warning("[WALL STREAM] Phase 2: first frame NOT ready by deadline")
+                else:
+                    log.info(f"[WALL STREAM] Phase 2: first frame ready @{ff_ready_ms} (load {ff_ready_ms - t_p2_start_ms}ms)")
+
+                # Phase 3 — wait, then unpause via command_async (non-blocking).
+                # The earlier sync version of this set used __setitem__ which
+                # waits for mpv to ack the property change; on a busy mpv that
+                # could block the asyncio coroutine for up to a second,
+                # producing a visible single-player offset on the wall. With
+                # command_async, the python side returns in ~50us; mpv applies
+                # pause=no on its next IPC tick (typically <5ms).
+                now_ms = int(time.time() * 1000)
+                wait_to_play = play_at_ms - now_ms
+                if wait_to_play > 0:
+                    log.info(f"[WALL STREAM] Phase 3: unpause in {wait_to_play}ms")
+                    await asyncio.sleep(wait_to_play / 1000.0)
+                try:
+                    self.mpv._mpv.command_async("set_property", "pause", False)
+                except Exception:
+                    pass
+                t_unpaused_ms = int(time.time() * 1000)
+                log.info(f"[WALL STREAM] UNPAUSED @{t_unpaused_ms} target={play_at_ms} drift={t_unpaused_ms - play_at_ms}ms")
+                # Arm continuous soft-sync correction. Cancels itself if
+                # _cancel_wall_rtp_task is called (= new push).
+                if self._sync_correction_task is None or self._sync_correction_task.done():
+                    self._sync_correction_task = asyncio.create_task(
+                        self._sync_correction_loop()
+                    )
+                    log.info("[WALL STREAM] Soft-sync correction loop armed")
             else:
-                stream_url += "?buffer_size=16777216&fifo_size=50000000&overrun_nonfatal=1"
+                # No sync tick — immediate transition (still no cmd_stop)
+                self.mpv.play_file(rtp_url, loop=False, vf=None)
 
-            self.mpv.play_file(stream_url, loop=False, vf=vf)
-
-            # Monitor for stream death: if mpv goes idle while we're supposed
-            # to be playing, the stream died (server restarted ffmpeg).
-            # Clear the dedup key so the next heartbeat re-opens the stream.
+            # Monitor for stream death
             await asyncio.sleep(5)
             while True:
                 await asyncio.sleep(2)
@@ -1231,7 +1607,6 @@ class Player:
                     if self.mpv._mpv["core-idle"]:
                         log.warning("[WALL STREAM] Stream died — clearing key for auto-recovery")
                         self._ndi_active_key = None
-                        # Restore keep-open for normal playlist playback
                         try:
                             self.mpv._mpv["keep-open"] = "always"
                         except Exception:
@@ -1241,11 +1616,183 @@ class Player:
                     return
         except asyncio.CancelledError:
             log.info("[WALL STREAM] Task cancelled (switching content)")
-            # Restore keep-open for normal playlist playback
             try:
                 self.mpv._mpv["keep-open"] = "always"
             except Exception:
                 pass
+            return
+
+    async def _stuck_player_watchdog(self) -> None:
+        """Recovery for genuinely-stuck mpv. CONSERVATIVE — was firing on
+        normal load transitions and looking like the "screenshots of video"
+        symptom (each rescue caused a brief re-load that flashed first
+        frames).
+
+        Now only fires when ALL of these hold:
+          - sync has been active for at least 30 s (warm-up window)
+          - playback_time has not advanced for 15 s
+          - mpv reports core-idle == False (it thinks it's playing — so a
+            stuck decode is real, not just paused or at EOF)
+          - at least 60 s since the previous rescue (backoff)
+        """
+        WARMUP_S = 30.0
+        STUCK_WINDOW_S = 15.0
+        BACKOFF_S = 60.0
+        sync_active_since = 0.0
+        last_pt = None
+        last_pt_ts = 0.0
+        last_rescue_ts = 0.0
+        try:
+            while True:
+                await asyncio.sleep(5.0)
+                if not self._sync_active:
+                    sync_active_since = 0.0
+                    last_pt = None
+                    continue
+                now_s = time.time()
+                if sync_active_since == 0.0:
+                    sync_active_since = now_s
+                    continue
+                if now_s - sync_active_since < WARMUP_S:
+                    last_pt = None
+                    continue
+
+                pt = getattr(self.mpv._mpv, "playback_time", None)
+                try:
+                    core_idle = bool(self.mpv._mpv["core-idle"])
+                except Exception:
+                    core_idle = True   # if we can't tell, assume idle (don't rescue)
+
+                # If mpv says it's idle (paused, EOF, etc.) we are not stuck —
+                # we just shouldn't be playing. Reset baseline.
+                if core_idle:
+                    last_pt = None
+                    continue
+
+                if pt is None or pt < 0:
+                    last_pt = None
+                    continue
+
+                if last_pt is None:
+                    last_pt = pt
+                    last_pt_ts = now_s
+                    continue
+                if abs(pt - last_pt) >= 0.25:
+                    last_pt = pt
+                    last_pt_ts = now_s
+                    continue
+
+                stuck_for = now_s - last_pt_ts
+                if stuck_for < STUCK_WINDOW_S:
+                    continue
+                if now_s - last_rescue_ts < BACKOFF_S:
+                    continue
+
+                log.warning(f"[WATCHDOG] genuinely stuck: pt={pt:.3f}s for "
+                            f"{stuck_for:.1f}s, core-idle=False — re-arming once "
+                            f"(next attempt allowed in {BACKOFF_S}s)")
+                try:
+                    self.mpv._mpv["pause"] = False
+                except Exception:
+                    pass
+                self._ndi_active_key = None
+                self._sync_active = False
+                last_rescue_ts = now_s
+                last_pt = None
+                sync_active_since = 0.0
+        except asyncio.CancelledError:
+            return
+
+    async def _sync_correction_loop(self) -> None:
+        """Soft-only correction. Local files keep mpv playing at real-time
+        once synchronized-unpaused, so cross-player drift is bounded by
+        per-player decoder jitter — small, gradual. Speed nudge fixes it
+        invisibly. NO hard seek (kept causing visible re-snap each cycle)."""
+        SYNC_PERIOD_S = 1.0    # check every 1s — keeps drift tighter
+        DEAD_BAND_MS = 20      # ±0.6 frame @30fps — image content shows even tiny drift
+        MICRO_SEEK_MS = 100    # 20-100ms: speed nudge; 100-500ms: micro seek (frame-accurate snap)
+        SPEED_GAIN_S = 1.0
+        SPEED_CLAMP = 0.10     # max ±10% speed change
+        HARD_THRESHOLD_MS = 500  # > 500ms: hard rescue (full re-arm)
+        log.info("[SYNC] soft correction loop started (no hard seek)")
+        try:
+            await asyncio.sleep(2.0)
+            while True:
+                await asyncio.sleep(SYNC_PERIOD_S)
+                if not self._sync_active or not self._sync_anchor_ms or not self._sync_duration_s:
+                    continue
+                D = float(self._sync_duration_s)
+                if D <= 0:
+                    continue
+                actual_pts = getattr(self.mpv._mpv, "playback_time", None)
+                if actual_pts is None or actual_pts < 0:
+                    continue
+
+                now_ms = int(time.time() * 1000)
+                elapsed_s = (now_ms - self._sync_anchor_ms) / 1000.0
+                expected_pts = elapsed_s % D
+                if expected_pts < 0:
+                    expected_pts += D
+
+                drift_s = expected_pts - actual_pts
+                # Wrap modulo loop length so end-of-loop != huge drift
+                if drift_s > D / 2:
+                    drift_s -= D
+                if drift_s < -D / 2:
+                    drift_s += D
+                drift_ms = drift_s * 1000.0
+
+                if abs(drift_ms) <= DEAD_BAND_MS:
+                    try:
+                        self.mpv._mpv.command_async("set_property", "speed", 1.0)
+                    except Exception:
+                        pass
+                    continue
+
+                # Hard rescue: drift > 500ms — snap to expected via mpv.seek()
+                if abs(drift_ms) > HARD_THRESHOLD_MS:
+                    log.warning(f"[SYNC] HARD RESCUE expected={expected_pts:.4f}s "
+                                f"actual={actual_pts:.4f}s drift={drift_ms:+.0f}ms — "
+                                f"seeking to catch up")
+                    try:
+                        self.mpv._mpv.seek(expected_pts, "absolute")
+                        self.mpv._mpv.command_async("set_property", "speed", 1.0)
+                    except Exception as e:
+                        log.warning(f"[SYNC] hard rescue failed: {e}")
+                    continue
+
+                # Micro seek: drift 100-500ms — frame-accurate snap (much faster
+                # than waiting for soft speed to converge). For static-image
+                # content (PPT slides), even 100ms drift is visible as different
+                # players being on different images at the same wallclock.
+                if abs(drift_ms) > MICRO_SEEK_MS:
+                    log.info(f"[SYNC] MICRO-SEEK expected={expected_pts:.4f}s "
+                             f"actual={actual_pts:.4f}s drift={drift_ms:+.0f}ms")
+                    try:
+                        self.mpv._mpv.seek(expected_pts, "absolute")
+                        self.mpv._mpv.command_async("set_property", "speed", 1.0)
+                    except Exception as e:
+                        log.warning(f"[SYNC] micro seek failed: {e}")
+                    continue
+
+                # Soft speed nudge for normal small drifts
+                ratio = 1.0 + drift_s / SPEED_GAIN_S
+                if ratio < 1.0 - SPEED_CLAMP:
+                    ratio = 1.0 - SPEED_CLAMP
+                if ratio > 1.0 + SPEED_CLAMP:
+                    ratio = 1.0 + SPEED_CLAMP
+                log.info(f"[SYNC] soft expected={expected_pts:.4f}s actual={actual_pts:.4f}s "
+                         f"drift={drift_ms:+.0f}ms speed={ratio:.4f}")
+                try:
+                    self.mpv._mpv.command_async("set_property", "speed", ratio)
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            try:
+                self.mpv._mpv.command_async("set_property", "speed", 1.0)
+            except Exception:
+                pass
+            log.info("[SYNC] correction loop cancelled, speed reset")
             return
 
     async def _duration_then_advance(self, seconds: float) -> None:
@@ -1263,12 +1810,15 @@ class Player:
         await self._play_index(next_index)
 
     def _cancel_wall_rtp_task(self) -> None:
-        """Cancel any running _play_wall_rtp task so its retry/sleep can't
-        stomp on the new playback command."""
+        """Cancel any running _play_wall_rtp task and the soft-sync loop."""
         if self._wall_rtp_task and not self._wall_rtp_task.done():
             self._wall_rtp_task.cancel()
             log.debug("[WALL RTP] Cancelled previous wall task")
         self._wall_rtp_task = None
+        if self._sync_correction_task and not self._sync_correction_task.done():
+            self._sync_correction_task.cancel()
+            log.debug("[WALL RTP] Cancelled previous sync-correction task")
+        self._sync_correction_task = None
 
     def _cancel_duration_timer(self) -> None:
         if self._duration_timer and not self._duration_timer.done():
@@ -1479,27 +2029,55 @@ class Player:
                     self._ndi_receiver.start(source_name, crop=ndi_crop)
 
         elif cmd == "load_wall_rtp":
-            # Wall stream — server streams all content types via ffmpeg multicast
+            # Wall stream — pre-cropped RTSP tile from server.
+            #
+            # Dedup includes play_at_ms so a fresh Push Live (server-issued
+            # new sync tick) re-arms the 3-phase open even if the URL is
+            # unchanged. Combined with keep-open=always and the removal of
+            # cmd_stop in _play_wall_rtp, mpv's loadfile-replace keeps the
+            # previous frame visible until the new first frame is ready —
+            # no visible blank at any point in the cycle.
             rtp_url = data.get("rtp_url")
-            crop = data.get("wall_crop")
             if not rtp_url:
                 return
-            wall_key = f"rtp_{rtp_url}_{json.dumps(crop, sort_keys=True)}"
+            # Capture soft-sync reference clock BEFORE the dedup check so it
+            # refreshes on every load_wall_rtp heartbeat, not just on the very
+            # first one. The first heartbeat after a push may have started_at=0
+            # if it raced the server's get_stream_clock() spawn-wait; later
+            # heartbeats carry the real value, but the dedup early-return would
+            # otherwise prevent the player from ever seeing them.
+            _started = data.get("wall_stream_started_at_ms")
+            _loop = data.get("wall_stream_loop_duration_s")
+            if _started:
+                self._wall_stream_started_at_ms = int(_started)
+            if _loop:
+                self._wall_stream_loop_duration_s = float(_loop)
+            play_at_ms = data.get("play_at_ms")
+            wall_key = f"rtp_{rtp_url}_{play_at_ms or 0}"
             if wall_key == self._ndi_active_key:
-                # Same stream — only skip if mpv is actually playing
                 try:
                     if not self.mpv._mpv["core-idle"]:
-                        log.debug("[WALL STREAM] Same stream active and playing — skip")
+                        # Already running this exact (URL, sync_tick) combo —
+                        # heartbeat is just persistence-firing, no work to do.
                         return
                     log.info("[WALL STREAM] Same key but mpv idle — retrying")
                 except Exception:
                     return
             self._cancel_wall_rtp_task()
             self._ndi_active_key = wall_key
-            log.info(f"[WALL STREAM] {rtp_url} crop={crop}")
-            self._wall_rtp_task = asyncio.create_task(
-                self._play_wall_rtp(rtp_url, crop)
-            )
+            log.info(f"[WALL STREAM] {rtp_url}  play_at_ms={play_at_ms}  "
+                     f"started_at={self._wall_stream_started_at_ms}  "
+                     f"loop={self._wall_stream_loop_duration_s}")
+            # HTTP URL -> new local-file playback path (seek + speed work)
+            # rtsp:// URL -> legacy live-stream path (kept for rollback)
+            if rtp_url.startswith("http://") or rtp_url.startswith("https://"):
+                self._wall_rtp_task = asyncio.create_task(
+                    self._play_wall_local(rtp_url, play_at_ms)
+                )
+            else:
+                self._wall_rtp_task = asyncio.create_task(
+                    self._play_wall_rtp(rtp_url, None, play_at_ms)
+                )
 
         elif cmd == "restart_service":
             log.info("[RESTART] Restarting signage-player service...")
