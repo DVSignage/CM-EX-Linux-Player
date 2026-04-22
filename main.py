@@ -2078,11 +2078,11 @@ class Player:
             # rtsp:// URL -> legacy live-stream path (kept for rollback)
             if rtp_url.startswith("http://") or rtp_url.startswith("https://"):
                 self._wall_rtp_task = asyncio.create_task(
-                    self._play_wall_local(rtp_url, play_at_ms)
+                    self._play_wall_local(rtp_url, play_at_ms, emit_audio)
                 )
             else:
                 self._wall_rtp_task = asyncio.create_task(
-                    self._play_wall_rtp(rtp_url, None, play_at_ms)
+                    self._play_wall_rtp(rtp_url, None, play_at_ms, emit_audio)
                 )
 
         elif cmd == "restart_service":
