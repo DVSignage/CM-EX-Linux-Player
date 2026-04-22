@@ -1293,7 +1293,7 @@ class Player:
     # Video wall helpers
     # ------------------------------------------------------------------
 
-    async def _play_wall_local(self, url: str, play_at_ms: Optional[int] = None) -> None:
+    async def _play_wall_local(self, url: str, play_at_ms: Optional[int] = None, emit_audio: bool = False) -> None:
         """Wall stream — HTTP-served local-file playback.
 
         Pipeline:
@@ -1355,7 +1355,7 @@ class Player:
             "interpolation": False,
             "framedrop":   "no",
             "hwdec":       "auto-safe",
-            "audio":       "no",
+            "audio":       ("auto" if emit_audio else "no"),
             "keep-open":   "always",
             "loop-file":   "inf",
             "cache":       "no",
@@ -1468,7 +1468,7 @@ class Player:
             return
 
     async def _play_wall_rtp(self, rtp_url: str, crop: Optional[dict],
-                              play_at_ms: Optional[int] = None) -> None:
+                              play_at_ms: Optional[int] = None, emit_audio: bool = False) -> None:
         """Video wall: open a pre-cropped RTSP tile stream from the server.
 
         The server does all the cropping — each player gets its own tile at
@@ -1511,7 +1511,7 @@ class Player:
                 "interpolation":               False,
                 "framedrop":                   "no",
                 "hwdec":                       "auto-safe",
-                "audio":                       "no",
+                "audio":                       ("auto" if emit_audio else "no"),
                 "keep-open":                   "always",
             }
             for _k, _v in rtsp_props.items():
@@ -2043,6 +2043,7 @@ class Player:
             # previous frame visible until the new first frame is ready —
             # no visible blank at any point in the cycle.
             rtp_url = data.get("rtp_url")
+            emit_audio = bool(data.get("emit_audio", False))
             if not rtp_url:
                 return
             # Capture soft-sync reference clock BEFORE the dedup check so it
