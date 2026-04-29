@@ -1500,19 +1500,54 @@ class Player:
         try:
             # No leading 0.3s sleep — wastes time before Phase 1 wait. Apply
             # the persistent RTSP tuning props directly.
+            #
+            # Two design decisions worth calling out (we tried both other
+            # ways before, the trade-offs below are why these are correct):
+            #
+            # video-sync=desync (NOT display-resample)
+            #   display-resample locks playback rate to the local panel's
+            #   actual refresh, which differs 0.1-0.5% between physical
+            #   monitors. Two players watching the same byte stream would
+            #   drift relative to each other. desync uses the system clock,
+            #   which chrony keeps within ~µs across the fleet — so all
+            #   players advance at the same true rate by construction.
+            #   This is the SAME setting the local-file path uses for
+            #   exactly the same reason.
+            #
+            # Tight buffers (cache-secs / demuxer-readahead 0.2 each)
+            #   was 0.5 each, i.e. up to 1 s of "look-ahead" before a frame
+            #   showed. On a tightly-controlled web-app wall (WebSocket
+            #   button presses) this turned 60 ms of real work into a 1+ s
+            #   visible delay. 0.2 s is enough to absorb LAN jitter without
+            #   ballooning the latency budget.
+            #
+            # Low-latency demuxer extras
+            #   - probesize/analyzeduration cut from 1 s to 0.1 s: open
+            #     a fresh RTSP session in <100 ms instead of a full second.
+            #   - demuxer-lavf-o=fflags=+nobuffer: don't bunch packets at
+            #     the demuxer.
+            #   - video-latency-hacks=yes: skip mpv's lip-sync verification
+            #     pass; harmless on signage (audio=no for most players).
             rtsp_props = {
                 "rtsp-transport":              "tcp",
                 "cache":                       "yes",
-                "cache-secs":                  0.5,
-                "demuxer-readahead-secs":      0.5,
-                "demuxer-lavf-probesize":      524288,
-                "demuxer-lavf-analyzeduration": 1000000,
-                "video-sync":                  "display-resample",
+                "cache-secs":                  0.2,                       # was 0.5
+                "demuxer-readahead-secs":      0.2,                       # was 0.5
+                "demuxer-lavf-probesize":      32768,                     # was 524288
+                "demuxer-lavf-analyzeduration": 100000,                   # was 1000000 (1 s → 0.1 s)
+                "demuxer-lavf-o":              "fflags=+nobuffer",
+                "video-sync":                  "desync",                  # was display-resample
+                "video-latency-hacks":         True,
                 "interpolation":               False,
                 "framedrop":                   "no",
                 "hwdec":                       "auto-safe",
                 "audio":                       ("auto" if emit_audio else "no"),
+                "audio-buffer":                0,
                 "keep-open":                   "always",
+                # Force a clean 60 Hz refresh assumption so desync's fall-
+                # back math is identical across players with mismatched
+                # monitors.
+                "display-fps-override":        60.0,
             }
             for _k, _v in rtsp_props.items():
                 try:
@@ -1595,11 +1630,16 @@ class Player:
                     pass
                 t_unpaused_ms = int(time.time() * 1000)
                 log.info(f"[WALL STREAM] UNPAUSED @{t_unpaused_ms} target={play_at_ms} drift={t_unpaused_ms - play_at_ms}ms")
-                # NO sync-correction loop here — RTSP streams are not
-                # seekable, so micro-seek / hard-rescue would 404 forever.
-                # Cross-player sync for RTSP comes entirely from the
-                # synchronised unpause tick above (same wallclock moment
-                # across all players with chrony-synced system clocks).
+                # Arm the RTSP-specific drift correction loop. SPEED-NUDGE
+                # only — RTSP isn't seekable so micro-seek / hard-rescue
+                # don't apply, but per-player decoder rate variance still
+                # accumulates into visible drift over minutes if nothing
+                # corrects it. _rtsp_sync_loop enforces the invariant
+                # "playback_time advances 1:1 with wallclock" with sub-JND
+                # ±1.5 % speed nudges. Cancelled by _cancel_wall_rtp_task.
+                if self._sync_correction_task is None or self._sync_correction_task.done():
+                    self._sync_correction_task = asyncio.create_task(self._rtsp_sync_loop())
+                    log.info("[WALL STREAM] RTSP drift-correction loop armed")
             else:
                 # No sync tick — immediate transition (still no cmd_stop)
                 self.mpv.play_file(rtp_url, loop=False, vf=None)
@@ -1625,6 +1665,97 @@ class Player:
                 self.mpv._mpv["keep-open"] = "always"
             except Exception:
                 pass
+            return
+
+    async def _rtsp_sync_loop(self) -> None:
+        """Speed-nudge drift correction for RTSP streams — NO seeks.
+
+        RTSP is not seekable, so the seek-based _sync_correction_loop
+        used for local files would 404 on every cycle. Instead we keep
+        the wall in lockstep by enforcing the invariant:
+
+            playback_time advances 1:1 with wallclock.
+
+        Phase-3 unpause aligns every player to the same shared (wallclock,
+        playback_time) anchor (within ~µs courtesy of chrony). After that,
+        per-decoder rate variance — typically ±0.1 % — slowly walks the
+        wall apart. We measure drift = elapsed_wallclock - elapsed_pt
+        every 2 s and apply a proportional speed correction clamped at
+        ±1.5 %. That's well below motion JND (~3 %) so the viewer never
+        sees the nudge, but cumulative drift converges back to zero.
+
+        Cancelled by _cancel_wall_rtp_task on Push Live or stop_wall.
+        """
+        SETTLE_S       = 3.0       # let playback stabilise before anchoring
+        PERIOD_S       = 2.0
+        DEAD_BAND_MS   = 30        # ±1 frame @ 30fps → ignore
+        MAX_ADJ        = 0.015     # max ±1.5 % speed change
+        GAIN_PER_MS    = 0.00005
+
+        log.info("[RTSP-SYNC] settling before anchor")
+        try:
+            await asyncio.sleep(SETTLE_S)
+
+            # Acquire a stable anchor — playback_time must be ≥ 0 and
+            # mpv must actually be playing (core-idle == False).
+            anchor_wc_ms = None
+            anchor_pt = None
+            for _ in range(10):
+                try:
+                    if self.mpv._mpv["core-idle"]:
+                        await asyncio.sleep(0.5)
+                        continue
+                    pt = self.mpv._mpv["playback-time"]
+                    if pt is not None and pt >= 0:
+                        anchor_wc_ms = int(time.time() * 1000)
+                        anchor_pt = float(pt)
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.3)
+
+            if anchor_wc_ms is None:
+                log.warning("[RTSP-SYNC] could not anchor (mpv never went active) — giving up")
+                return
+            log.info(f"[RTSP-SYNC] anchored: wc={anchor_wc_ms} pt={anchor_pt:.3f}")
+
+            while True:
+                await asyncio.sleep(PERIOD_S)
+                try:
+                    pt = self.mpv._mpv["playback-time"]
+                    if pt is None or pt < 0:
+                        continue
+                    if self.mpv._mpv["core-idle"]:
+                        continue
+                except Exception:
+                    continue
+
+                now_wc_ms = int(time.time() * 1000)
+                elapsed_wc_ms = now_wc_ms - anchor_wc_ms
+                elapsed_pt_ms = (float(pt) - anchor_pt) * 1000.0
+                drift_ms = elapsed_wc_ms - elapsed_pt_ms   # +ve: we're behind
+
+                if abs(drift_ms) < DEAD_BAND_MS:
+                    try:
+                        self.mpv._mpv.command_async("set_property", "speed", 1.0)
+                    except Exception:
+                        pass
+                    continue
+
+                adj = max(-MAX_ADJ, min(MAX_ADJ, drift_ms * GAIN_PER_MS))
+                new_speed = 1.0 + adj
+                try:
+                    self.mpv._mpv.command_async("set_property", "speed", new_speed)
+                    log.info(f"[RTSP-SYNC] drift={drift_ms:+.0f}ms → speed={new_speed:.4f}")
+                except Exception:
+                    pass
+
+        except asyncio.CancelledError:
+            try:
+                self.mpv._mpv.command_async("set_property", "speed", 1.0)
+            except Exception:
+                pass
+            log.info("[RTSP-SYNC] cancelled")
             return
 
     async def _stuck_player_watchdog(self) -> None:
