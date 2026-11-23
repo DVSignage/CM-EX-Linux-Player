@@ -21,5 +21,10 @@ playback:
   # Default duration in seconds for images when the playlist item has duration=0
   default_image_duration: 10
 
+# Cache (optional): how many recent playlists stay cached, so switching back
+# to one needs no re-download (1-100)
+cache:
+  keep_playlists: 10
+
 # Log verbosity: DEBUG, INFO, WARNING, ERROR
 log_level: "INFO"

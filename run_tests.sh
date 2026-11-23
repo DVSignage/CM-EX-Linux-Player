@@ -1,28 +1,13 @@
 #!/bin/bash
-# Test runner script for the player daemon
+# Test runner for the CM:EX Linux Player. The suite needs no mpv, display
+# or browser: playback is exercised against fakes and an in-memory CMS.
 
 set -e
+cd "$(dirname "$0")"
 
-echo "================================"
-echo "Digital Signage Player - Tests"
-echo "================================"
-echo ""
-
-# Check if pytest is installed
-if ! command -v pytest &> /dev/null; then
+if ! python3 -c "import pytest" &> /dev/null; then
     echo "pytest not found. Installing test dependencies..."
-    pip3 install pytest pytest-asyncio pytest-cov
+    pip3 install -r requirements-dev.txt
 fi
 
-# Run tests
-echo "Running tests..."
-echo ""
-
-# Run with coverage
-pytest -v --cov=. --cov-report=term-missing --cov-report=html tests/
-
-echo ""
-echo "================================"
-echo "Tests complete!"
-echo "Coverage report: htmlcov/index.html"
-echo "================================"
+python3 -m pytest -q "$@"

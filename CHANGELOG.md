@@ -1,106 +1,61 @@
 # Changelog
 
-All notable changes to the Digital Signage Player will be documented in this file.
+All notable changes to the CM:EX Linux Player.
+
+## [2.0.0] - 2026-11-23
+
+Brought to parity with the DVSI Plus CMX player (core tier) and restructured
+into the `cmx/` package.
+
+### Added
+- Player secret: saved from the enrollment approval and sent as
+  `X-Player-Secret`; `state.json` is now owner-only.
+- Registration screen with a Connect:EX QR code; enrollment keeps the same
+  code through 404/429/503 answers (10-minute cap per code).
+- Command envelope: `command_id` commands run once and every delivery is
+  acknowledged with its real result; unsupported commands are refused with a
+  reason.
+- SSE push channel (`/players/{id}/events`).
+- New commands: `stop`, `replay`, `seek`, `refresh`, `set_volume`,
+  `delete_player`, `load_wall_content` (download + crop); heartbeat desired
+  state (`audio_volume`, `audio_muted`, `desired_blank`).
+- Heartbeat: `playback_status`, clip-relative `position`/`duration`,
+  `current_content_id`, an `error` line for real faults, device lists.
+- Clip in/out (`clip_start`/`clip_end`), single-item loop in place, identical
+  re-applies keep the playback position.
+- Templates load `/templates/{id}/render` scaled to the screen; RSS loads
+  `/rss/{id}/render`; web aliases (`webpage`, `iframe`, `link`, `embed`, `web`).
+- Cache: files keyed `{content_id}{ext}`, picture/video decided by the file's
+  bytes, Range resume, background retries for assets not ready yet, the last N
+  playlists kept cached (`cache.keep_playlists`).
+- Pushed live preview (`preview_watch` → `/players/{id}/preview-frame`).
+- Telemetry queue with `boot` and `crash` events.
+- Offline handling: 15 s reconnect polling, status screens, the playlist is
+  refetched when the CMS comes back.
+- Test suite against the real code, plus `tests/fake_cms.py`.
+
+### Fixed
+- `restart_service` did nothing: `sudo systemctl` is blocked by
+  `NoNewPrivileges=true`. The player now exits after the ack and systemd
+  restarts it (`RestartSec` 10 → 3).
+- mpv could stay black on machines without working GL: the video output is now
+  a fallback list (`gpu,x11,drm`) chosen when mpv opens it.
+- Runtime mpv properties were read through python-mpv's options namespace and
+  always failed, so the wall-stream death detection never fired.
+- Shutdown raised "Event loop stopped before Future completed".
+- `log_level` and `playback.default_image_duration` were ignored.
+- `setup.py` pointed at a missing `main:main`.
+- `install.sh` aborted when the optional NDI packages had no wheel; NDI moved
+  to `requirements-ndi.txt` and installs best-effort.
+- The offline installer and package builder missed `psutil`.
+- `deploy-update.ps1` only pushed `main.py`, its `ssh` call never splatted
+  its arguments, and it did not parse in Windows PowerShell 5.1.
+
+### Removed
+- Unused legacy modules (`api_client/`, `config/`, `core/`, `network/`,
+  `utils/`, `dev_tools.py`) and the tests that imported a never-committed
+  `cache/` package.
 
 ## [1.0.0] - 2024
 
-### Added
-
-#### Core Features
-- Media player engine using mpv with support for videos and images
-- Playlist execution engine with sequential playback
-- Seamless transitions with frame-holding capability
-- Support for looping playlists
-
-#### API Integration
-- HTTP client for CMS API communication
-- Heartbeat system with status reporting (every 15 seconds)
-- Get assigned playlist from API
-- Command handling system for remote control:
-  - Play/pause/stop commands
-  - Next/previous navigation
-  - Playlist loading
-
-#### Caching System
-- Local cache manager with SQLite database
-- LRU (Least Recently Used) eviction policy
-- Configurable cache size limits
-- Content integrity verification with checksums
-- Prefetch capability for upcoming playlist items
-- Offline playback support
-
-#### Network Features
-- Network share monitoring using watchdog
-- Support for local paths, SMB, and NFS shares
-- Auto-discovery of media files
-- File change detection (add/modify/delete)
-
-#### Configuration
-- YAML-based configuration system
-- Pydantic settings validation
-- Environment variable support
-- Multiple config file search paths
-
-#### System Integration
-- Systemd service configuration
-- Logging to console and file
-- Signal handling for graceful shutdown
-- Auto-start on boot capability
-
-#### Development Tools
-- Comprehensive test suite with pytest
-- Development utilities script (dev_tools.py)
-- Configuration generation and validation tools
-- Cache management utilities
-- Test playlist generator
-
-#### Documentation
-- Complete README with installation instructions
-- Quick start guide
-- Systemd service setup guide
-- Troubleshooting section
-- API integration documentation
-
-### Technical Details
-
-#### Architecture
-- Asynchronous design using asyncio
-- Modular component structure
-- Type hints throughout codebase
-- Event-driven player callbacks
-
-#### Dependencies
-- python-mpv for media playback
-- httpx for async HTTP client
-- watchdog for file system monitoring
-- pydantic for configuration validation
-- PyYAML for config file parsing
-
-#### Testing
-- Unit tests for playlist management
-- Cache manager tests
-- Configuration loading tests
-- Test coverage reporting
-
-### Known Limitations
-
-- SMB/NFS shares must be pre-mounted at system level
-- No built-in authentication for API (relies on network security)
-- Frame-perfect transitions depend on mpv capabilities
-- Requires X11 display server (no Wayland support yet)
-
-### Future Enhancements
-
-Potential features for future releases:
-- WebSocket support for real-time commands
-- Advanced transition effects (fade, slide, etc.)
-- Audio-only content support
-- Multi-zone playback
-- Performance metrics reporting
-- Auto-update capability
-- Web-based configuration interface
-- Support for streaming content (RTSP, HTTP)
-
-## Version History
-
-- **1.0.0** - Initial release with full feature set
+Initial release.

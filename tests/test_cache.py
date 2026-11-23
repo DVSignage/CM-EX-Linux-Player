@@ -1,111 +1,124 @@
-"""
-Tests for cache manager.
-"""
+import asyncio
+import json
 
+import httpx
 import pytest
-import tempfile
-from pathlib import Path
 
-from cache.manager import CacheManager
+from cmx.cache import (BACKOFF, CacheStore, PendingDownloads, identify, is_image_file, misnamed_as,
+                       repair_name)
+from cmx.cms_client import CmsClient, CmsError, ContentGone, ContentNotReady
 
-
-@pytest.fixture
-def temp_cache_dir():
-    """Create a temporary cache directory."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield Path(tmpdir)
+from conftest import MP4_HEAD, PNG_HEAD
 
 
-@pytest.fixture
-def cache_manager(temp_cache_dir):
-    """Create a cache manager instance."""
-    # 10 MB cache
-    return CacheManager(temp_cache_dir, max_size_bytes=10 * 1024 * 1024)
+def test_identify_signatures():
+    assert identify(PNG_HEAD) == ("image", ".png")
+    assert identify(b"\xff\xd8\xff\xe0" + b"\x00" * 12) == ("image", ".jpg")
+    assert identify(MP4_HEAD) == ("video", ".mp4")
+    assert identify(b"\x00\x00\x00\x14ftypqt  " + b"\x00" * 4) == ("video", ".mov")
+    assert identify(b"\x1a\x45\xdf\xa3" + b"\x00" * 12) == ("video", ".webm")
+    assert identify(b"hello world12345") == ("unknown", None)
 
 
-@pytest.fixture
-def test_file():
-    """Create a temporary test file."""
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
-        f.write("Test content for caching")
-        temp_path = Path(f.name)
-
-    yield temp_path
-
-    # Cleanup
-    if temp_path.exists():
-        temp_path.unlink()
+def test_bytes_decide_picture_vs_video(tmp_path):
+    p = tmp_path / "c1.mp4"
+    p.write_bytes(PNG_HEAD)
+    assert is_image_file(p)
+    assert misnamed_as(p) == ".png"
+    fixed = repair_name(p)
+    assert fixed.name == "c1.png" and fixed.exists() and not p.exists()
 
 
-def test_cache_add(cache_manager, test_file):
-    """Test adding a file to cache."""
-    cached_path = cache_manager.add("test-content-1", test_file)
-
-    assert cached_path is not None
-    assert cached_path.exists()
-    assert cache_manager.has("test-content-1")
-
-
-def test_cache_get(cache_manager, test_file):
-    """Test retrieving a cached item."""
-    cache_manager.add("test-content-1", test_file)
-
-    entry = cache_manager.get("test-content-1")
-
-    assert entry is not None
-    assert entry.content_id == "test-content-1"
-    assert entry.file_path.exists()
+def test_find_repairs_a_misnamed_cache_file(tmp_path):
+    store = CacheStore(tmp_path / "cache", tmp_path / "h.json")
+    store.dir.mkdir()
+    (store.dir / "c9.mp4").write_bytes(PNG_HEAD)
+    found = store.find("c9", store.dir / "c9.jpg")
+    assert found == store.dir / "c9.png"
+    assert store.find("missing", store.dir / "missing.mp4") is None
 
 
-def test_cache_remove(cache_manager, test_file):
-    """Test removing a cached item."""
-    cache_manager.add("test-content-1", test_file)
-    assert cache_manager.has("test-content-1")
-
-    removed = cache_manager.remove("test-content-1")
-
-    assert removed is True
-    assert not cache_manager.has("test-content-1")
-
-
-def test_cache_has(cache_manager, test_file):
-    """Test checking if content is cached."""
-    assert not cache_manager.has("test-content-1")
-
-    cache_manager.add("test-content-1", test_file)
-
-    assert cache_manager.has("test-content-1")
+def test_retention_keeps_the_union_of_recent_playlists(tmp_path):
+    store = CacheStore(tmp_path / "cache", tmp_path / "h.json", keep_playlists=2)
+    store.dir.mkdir()
+    for n in ("a.mp4", "b.mp4", "c.mp4", "x.mp4.tmp"):
+        (store.dir / n).write_bytes(b"x")
+    store.retain_and_prune({"a.mp4"})
+    assert sorted(p.name for p in store.dir.iterdir()) == ["a.mp4", "x.mp4.tmp"]   # .tmp never pruned
+    (store.dir / "b.mp4").write_bytes(b"x")
+    store.retain_and_prune({"b.mp4"})
+    assert sorted(p.name for p in store.dir.iterdir()) == ["a.mp4", "b.mp4", "x.mp4.tmp"]
+    store.retain_and_prune({"b.mp4"})          # same set again: deduped, a is still kept
+    assert (store.dir / "a.mp4").exists()
+    (store.dir / "c.mp4").write_bytes(b"x")
+    store.retain_and_prune({"c.mp4"})          # N=2: a falls out
+    assert sorted(p.name for p in store.dir.iterdir()) == ["b.mp4", "c.mp4", "x.mp4.tmp"]
+    assert json.loads((tmp_path / "h.json").read_text()) == [["c.mp4"], ["b.mp4"]]
 
 
-def test_cache_stats(cache_manager, test_file):
-    """Test cache statistics."""
-    stats = cache_manager.get_stats()
-    assert stats["total_items"] == 0
-
-    cache_manager.add("test-content-1", test_file)
-
-    stats = cache_manager.get_stats()
-    assert stats["total_items"] == 1
-    assert stats["total_size_bytes"] > 0
-
-
-def test_cache_clear(cache_manager, test_file):
-    """Test clearing the cache."""
-    cache_manager.add("test-content-1", test_file)
-    cache_manager.add("test-content-2", test_file)
-
-    assert cache_manager.get_entry_count() == 2
-
-    cache_manager.clear()
-
-    assert cache_manager.get_entry_count() == 0
+def test_lru_cap_for_direct_picks(tmp_path):
+    store = CacheStore(tmp_path / "cache", tmp_path / "h.json")
+    store.dir.mkdir()
+    import os
+    for i in range(5):
+        p = store.dir / f"f{i}.mp4"
+        p.write_bytes(b"x")
+        os.utime(p, (1000 + i, 1000 + i))
+    removed = store.enforce_lru({"f0.mp4"}, max_unassigned=2)
+    assert removed == 2
+    assert sorted(p.name for p in store.dir.iterdir()) == ["f0.mp4", "f3.mp4", "f4.mp4"]
 
 
-def test_cache_duplicate_add(cache_manager, test_file):
-    """Test adding the same content twice."""
-    cached_path1 = cache_manager.add("test-content-1", test_file)
-    cached_path2 = cache_manager.add("test-content-1", test_file)
+def test_pending_backoff_and_fault():
+    now = [0.0]
+    p = PendingDownloads(clock=lambda: now[0])
+    from pathlib import Path
+    for _ in range(3):
+        p.failed("c1", Path("c1.mp4"), "promo.mp4")
+    assert p.entries["c1"].attempts == 3
+    assert p.entries["c1"].retry_at == BACKOFF[2]
+    assert p.fault() == "promo.mp4 could not be downloaded after 3 attempts; still retrying"
+    p.not_ready("c2", Path("c2.mp4"), "b.mp4", 45)
+    assert p.entries["c2"].attempts == 0 and p.entries["c2"].retry_at == 45
+    p.keep_only({"c2"})
+    assert list(p.entries) == ["c2"]
 
-    # Should return same path and not duplicate
-    assert cached_path1 == cached_path2
-    assert cache_manager.get_entry_count() == 1
+
+def _client(handler):
+    return CmsClient("http://cms", lambda: "s3cret", httpx.MockTransport(handler))
+
+
+def test_download_resumes_with_range(tmp_path):
+    dest = tmp_path / "c1.mp4"
+    (tmp_path / "c1.mp4.tmp").write_bytes(b"0123")
+    seen = {}
+
+    def handler(request):
+        seen["range"] = request.headers.get("Range")
+        seen["secret"] = request.headers.get("X-Player-Secret")
+        return httpx.Response(206, content=b"4567", headers={"Content-Range": "bytes 4-7/8"})
+
+    asyncio.run(_client(handler).download("c1", dest))
+    assert seen == {"range": "bytes=4-", "secret": "s3cret"}
+    assert dest.read_bytes() == b"01234567"
+    assert not (tmp_path / "c1.mp4.tmp").exists()
+
+
+def test_download_200_restarts_partial(tmp_path):
+    dest = tmp_path / "c1.mp4"
+    (tmp_path / "c1.mp4.tmp").write_bytes(b"junk")
+    asyncio.run(_client(lambda r: httpx.Response(200, content=b"fresh")).download("c1", dest))
+    assert dest.read_bytes() == b"fresh"
+
+
+def test_download_status_handling(tmp_path):
+    dest = tmp_path / "c1.mp4"
+    with pytest.raises(ContentNotReady) as e:
+        asyncio.run(_client(lambda r: httpx.Response(503, headers={"Retry-After": "20"})).download("c1", dest))
+    assert e.value.retry_after == 20
+    with pytest.raises(ContentGone):
+        asyncio.run(_client(lambda r: httpx.Response(410)).download("c1", dest))
+    (tmp_path / "c1.mp4.tmp").write_bytes(b"stale")
+    with pytest.raises(CmsError):
+        asyncio.run(_client(lambda r: httpx.Response(416)).download("c1", dest))
+    assert not (tmp_path / "c1.mp4.tmp").exists()

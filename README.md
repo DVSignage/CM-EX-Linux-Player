@@ -154,6 +154,9 @@ playback:
   audio_output: "auto"       # "auto" lets mpv choose, or use a device name
   default_image_duration: 10 # seconds to show an image when duration is not set
 
+cache:
+  keep_playlists: 10         # recent playlists kept cached (1-100)
+
 log_level: "INFO"            # DEBUG, INFO, WARNING, ERROR
 ```
 
@@ -260,10 +263,16 @@ EOF
 | `/opt/signage-player/` | Player code and virtual environment |
 | `/opt/signage-player/config.yaml` | CMS URL and playback settings |
 | `/opt/signage-player/venv/` | Python virtual environment |
-| `/home/signage/.config/signage-player/state.json` | Player identity (player_id, enrollment state) |
-| `/home/signage/.config/signage-player/cache/` | Downloaded media files |
-| `/home/signage/.config/signage-player/offline_playlist.json` | Last known playlist for instant boot playback |
+| `~/.config/signage-player/state.json` | Player identity: `player_id`, `player_secret`, site, volume (owner-only, 0600) |
+| `~/.config/signage-player/cache/` | Downloaded media, named `{content_id}{ext}` |
+| `~/.config/signage-player/cache-history.json` | File sets of the last N playlists kept in the cache |
+| `~/.config/signage-player/offline_playlist.json` | Last applied playlist, played instantly at boot |
+| `~/.config/signage-player/telemetry-queue.json` | Telemetry events waiting to be delivered |
+| `~/.config/signage-player/crash/` | Crash records, reported at the next start |
+| `~/.config/signage-player/local-api.key` | Key for the local preview routes (0600) |
 | `/etc/systemd/system/signage-player.service` | Systemd service unit |
+
+`~` is the home of the user the service runs as (the desktop user chosen by `install.sh`).
 
 ---
 
@@ -333,40 +342,91 @@ The player detects a 404 on the next heartbeat, clears its identity, and immedia
 
 ## Architecture
 
+The player follows the **DVSI Plus CMX player** (the native Windows port in
+`DVSignage/win-web-wrap`) for its CMS contract, at the core tier: everything
+except edge/LAN mode, the native interactive-wall engine, machine inventory
+and DeckLink capture.
+
 ```
-player/
-├── main.py              # Full orchestrator -- enrollment, heartbeat,
-│                        # download, playback, dedup, GC
-├── core/
-│   └── player.py        # MpvPlayer -- thin mpv wrapper (fullscreen,
-│                        # OSD text, EOF callback, play/pause/stop)
-├── config.yaml.example  # Template config
-├── signage-player.service  # Systemd unit file
-├── install.sh           # Automated installer
-└── requirements.txt     # Python dependencies
+main.py                 # entry point: config, logging, crash hook, run
+cmx/
+├── player.py           # orchestrator: startup, enrollment, heartbeat, SSE,
+│                       # commands + acks, playlist download/apply, refresh
+├── cms_client.py       # CM:EX REST client (timeouts, secret header, Range resume)
+├── commands.py         # command envelope: execute once, ack every delivery
+├── items.py            # playlist item classification, dwell, clip in/out
+├── cache.py            # {content_id}{ext} cache, byte sniffing, retention, retries
+├── playback.py         # mpv wrapper + playlist engine
+├── browser.py          # Chromium kiosk for web / RSS / template pages
+├── wall.py             # wall crop filters, multicast wall stream
+├── screens.py          # registration (code + Connect:EX QR) and status screens
+├── telemetry.py        # spooled telemetry queue, boot/crash events
+├── faults.py           # the heartbeat "error" line
+├── health.py           # metrics, LAN address
+├── preview.py          # pushed live preview
+├── local_api.py        # local API on port 8081
+└── config.py           # config.yaml, paths, state.json
+ndi/engine.py           # optional NDI receive/send
+tests/                  # pytest suite + fake_cms.py
 ```
 
-`main.py` is intentionally a single self-contained file. All CMS communication, caching, and playback orchestration lives there -- making it easy to read, copy to a device, or modify without a complex module tree.
+Run the tests with `./run_tests.sh` (or `python3 -m pytest -q`); they need no
+mpv, display or browser.
 
 ---
 
-## How content delivery works
+## How it works
+
+**Enrollment.** The player requests a code and shows it with a Connect:EX QR
+code (`dvsiconnect://enroll?...`). It keeps polling with the same code through
+404/429/503 answers and only asks for a new one when the code expires, is
+rejected, or nobody approves it for 10 minutes. The approval's `player_secret`
+is saved and sent as `X-Player-Secret` on every player request.
+
+**Startup.** `offline_playlist.json` plays from the cache straight away, then
+one heartbeat (bounded to 5 s) decides: registered → normal routines; 404 →
+re-enroll; unreachable → keep playing offline.
+
+**Heartbeat.** Every 500 ms online, every 15 s while offline. It reports
+playback state, clip-relative position/duration, what is on screen, an `error`
+line for real faults, system metrics and the LAN address. A 404 means the
+player was deleted: identity, cache and offline copy are wiped and a new code
+is shown.
+
+**Commands** arrive on the heartbeat and on the SSE stream
+(`/players/{id}/events`). A command with a `command_id` runs once and every
+delivery is acknowledged (`POST /players/{id}/ack`) with its real result;
+commands this player doesn't implement are refused with a reason. Supported:
+`load_playlist`, `load_content`, `load_wall_content`, `load_wall_rtp`,
+`stop_wall`, `play`, `pause`, `stop`, `replay`/`restart`, `next`, `previous`,
+`seek`, `refresh`, `set_volume`, `delete_player`, `restart_service`, and the
+NDI commands. Desired state on the heartbeat (`audio_volume`, `audio_muted`,
+`desired_blank`) is applied too.
+
+**Content delivery.**
 
 ```
-CMS Portal
-  └─ Admin assigns playlist to player
-
-Player heartbeat (every 500ms)
-  └─ CMS responds: { command: "load_playlist", playlist_hash: "..." }
-
-Player checks hash against last loaded hash
-  ├─ Same → skip (no redundant fetch)
-  └─ Different → GET /api/v1/players/{id}/assigned-playlist
-       └─ For each item: GET /api/v1/content/{id}/stream
-            ├─ Already cached → play immediately
-            └─ Not cached → download to .tmp, rename on completion
-                 └─ First file ready → start playing
-                 └─ Rest download in background → playlist updates seamlessly
+load_playlist (new playlist_hash)
+  └─ GET /api/v1/players/{id}/assigned-playlist
+       ├─ save offline_playlist.json
+       ├─ template → Chromium on /api/v1/templates/{id}/render (scaled to fit)
+       ├─ url/web  → Chromium on content.url
+       ├─ rss      → Chromium on /api/v1/rss/{id}/render
+       └─ media    → cache/{content_id}{ext}
+            ├─ cached → play
+            └─ GET /api/v1/content/{id}/stream (resumes a partial .tmp with Range)
+                 ├─ first item ready → start playing
+                 ├─ 503 / failure → retried in the background (30 s … 30 min)
+                 └─ the cache keeps the last N playlists (cache.keep_playlists)
 ```
 
-On reboot, `offline_playlist.json` is loaded instantly from disk before any network request -- so playback resumes in under a second even on a slow connection.
+An identical playlist re-sent by the CMS keeps playing where it is instead of
+restarting. A single-item playlist loops in place. `clip_start`/`clip_end`
+trim videos, enforced by mpv.
+
+**Preview.** When the CMS heartbeat says `preview_watch`, the player pushes
+JPEG frames to `/players/{id}/preview-frame` (640×360 every 2 s, or 960×540
+every second for a live view).
+
+**Restart from the CMS.** `restart_service` is acknowledged, then the player
+exits and systemd (`Restart=always`) starts it again three seconds later.
