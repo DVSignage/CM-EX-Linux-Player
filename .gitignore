@@ -45,8 +45,8 @@ htmlcov/
 config.yaml
 *.local.yaml
 
-# Cache
-cache/
+# Cache (anchored: an unanchored "cache/" once hid a whole source package)
+/cache/
 *.db
 *.db-journal
 

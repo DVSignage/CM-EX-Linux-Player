@@ -1,1 +1,0 @@
-"""Network share monitoring module."""
