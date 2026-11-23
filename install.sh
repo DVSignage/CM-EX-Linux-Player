@@ -383,6 +383,16 @@ python3 -m venv "$VENV_DIR" --clear
 "$VENV_DIR/bin/pip" install --upgrade pip --quiet
 "$VENV_DIR/bin/pip" install -r "$INSTALL_DIR/requirements.txt" --quiet
 
+# NDI is optional: ndi-python has no wheel for every Python version, so a
+# failure here must not abort the whole install.
+if [[ -f "$INSTALL_DIR/requirements-ndi.txt" ]]; then
+    if "$VENV_DIR/bin/pip" install -r "$INSTALL_DIR/requirements-ndi.txt" --quiet; then
+        ok "NDI support installed"
+    else
+        warn "NDI packages could not be installed — the player will run without NDI"
+    fi
+fi
+
 # Check if python-mpv is compatible with system libmpv
 # If not, downgrade to a version that works
 if ! "$VENV_DIR/bin/python3" -c "import mpv; mpv.MPV()" &>/dev/null 2>&1; then
@@ -507,7 +517,8 @@ Group=$DESKTOP_USER
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$VENV_DIR/bin/python3 $INSTALL_DIR/main.py
 Restart=always
-RestartSec=10
+# restart_service from the CMS exits the process; systemd brings it back
+RestartSec=3
 StandardOutput=journal
 StandardError=journal
 

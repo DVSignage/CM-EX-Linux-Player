@@ -10,7 +10,7 @@ Group=signage
 WorkingDirectory=/opt/signage-player
 ExecStart=/usr/bin/python3 /opt/signage-player/main.py
 Restart=always
-RestartSec=10
+RestartSec=3
 StandardOutput=journal
 StandardError=journal
 

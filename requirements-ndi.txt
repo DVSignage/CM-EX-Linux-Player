@@ -1,0 +1,5 @@
+# Optional NDI support. The player runs without these; install.sh installs
+# them best-effort because ndi-python has no wheel for every Python version.
+ndi-python>=5.1.0
+numpy>=1.24.0
+opencv-python>=4.8.0
