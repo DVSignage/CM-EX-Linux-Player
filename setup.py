@@ -1,44 +1,41 @@
 #!/usr/bin/env python3
 """
-Setup script for the Digital Signage Player.
+Setup script for the CM:EX Linux Player.
 """
 
 from pathlib import Path
 from setuptools import setup, find_packages
 
-# Read requirements
-requirements_path = Path(__file__).parent / "requirements.txt"
-with open(requirements_path) as f:
-    requirements = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+HERE = Path(__file__).parent
 
-# Read README
-readme_path = Path(__file__).parent / "README.md"
-with open(readme_path, encoding="utf-8") as f:
-    long_description = f.read()
+
+def _requirements(name: str) -> list:
+    lines = (HERE / name).read_text(encoding="utf-8").splitlines()
+    return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith(("#", "-r"))]
+
 
 setup(
     name="signage-player",
-    version="1.0.0",
-    description="Digital Signage CMS Media Player Daemon",
-    long_description=long_description,
+    version="2.1.0",
+    description="CM:EX Linux digital signage player",
+    long_description=(HERE / "README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
-    author="Digital Signage CMS",
+    author="DVSignage",
     python_requires=">=3.10",
-    packages=find_packages(exclude=["tests", "tests.*"]),
-    install_requires=requirements,
+    packages=find_packages(include=["cmx", "cmx.*", "ndi", "ndi.*"]),
+    package_data={"cmx.renderer": ["static/*"]},
+    py_modules=["main"],
+    install_requires=_requirements("requirements.txt"),
+    extras_require={"ndi": _requirements("requirements-ndi.txt")},
     entry_points={
         "console_scripts": [
             "signage-player=main:main",
         ],
     },
     classifiers=[
-        "Development Status :: 4 - Beta",
         "Intended Audience :: System Administrators",
         "Topic :: Multimedia :: Video :: Display",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
-        "Programming Language :: Python :: 3.12",
         "Operating System :: POSIX :: Linux",
     ],
 )

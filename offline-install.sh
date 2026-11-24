@@ -261,7 +261,7 @@ info "Installing Python packages from bundled wheels..."
 "$VENV_DIR/bin/pip" install \
     --no-index \
     --find-links "$SOURCE_DIR/wheels" \
-    python-mpv httpx PyYAML aiofiles \
+    python-mpv httpx PyYAML psutil qrcode Pillow \
     --quiet
 
 # Verify python-mpv works with system libmpv
@@ -356,7 +356,7 @@ Group=$DESKTOP_USER
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$VENV_DIR/bin/python3 $INSTALL_DIR/main.py
 Restart=always
-RestartSec=10
+RestartSec=3
 StandardOutput=journal
 StandardError=journal
 

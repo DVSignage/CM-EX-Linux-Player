@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CM:EX Player</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="stage">
+    <div id="media">
+      <div class="layer" id="layerA"></div>
+      <div class="layer" id="layerB"></div>
+    </div>
+    <iframe id="web" allow="autoplay; camera; microphone; fullscreen" referrerpolicy="no-referrer"></iframe>
+    <div id="snapshot"><img alt=""><div class="badge"></div></div>
+    <div id="template"></div>
+    <div id="capture"><video autoplay playsinline></video><div class="hint"></div></div>
+    <div id="music">
+      <canvas id="musicWave"></canvas>
+      <div class="card">
+        <div class="disc">&#9835;</div>
+        <div class="label">NOW PLAYING</div>
+        <div class="title"><span></span></div>
+        <div class="bar"><div class="fill"></div></div>
+        <div class="times"><span class="el">0:00</span><span class="tot">0:00</span></div>
+      </div>
+    </div>
+    <div id="screen"></div>
+  </div>
+  <div id="overlay"><div class="box"><div class="t"></div><div class="b"></div></div></div>
+  <div id="osd"></div>
+  <div id="download"><div class="t"></div><div class="bar"><div class="fill"></div></div></div>
+  <div id="loading"></div>
+  <script src="/static/renderer.js"></script>
+  <script src="/static/template.js"></script>
+  <script src="/static/wall.js"></script>
+  <script src="/static/capture.js"></script>
+</body>
+</html>

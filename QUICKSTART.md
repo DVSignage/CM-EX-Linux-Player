@@ -1,120 +1,74 @@
 # Quick Start Guide
 
-Get the Digital Signage Player running in 5 minutes.
+Run the CM:EX Linux Player from a clone, for development or a quick test.
+For a real screen, use the installer in [README.md](README.md).
 
 ## Prerequisites
 
-- Linux system with X11
+- Linux with X11 (or Wayland with XWayland)
 - Python 3.10+
-- mpv installed
-
-## Installation
-
-### 1. Install Dependencies
-
-**Ubuntu/Debian:**
-```bash
-sudo apt-get install -y python3 python3-pip mpv libmpv-dev
-```
-
-**Fedora/RHEL:**
-```bash
-sudo dnf install -y python3 python3-pip mpv mpv-libs-devel
-```
-
-### 2. Install Python Packages
+- mpv with libmpv; Chromium for templates, web pages and RSS
 
 ```bash
-cd player
-pip3 install -r requirements.txt
+sudo apt-get install -y python3 python3-venv mpv libmpv2 chromium   # Ubuntu/Debian
 ```
 
-### 3. Create Configuration
+## Install
 
 ```bash
-# Generate default config
-python3 dev_tools.py generate-config config.yaml
-
-# Edit configuration
-nano config.yaml
+git clone https://github.com/DVSignage/CM-EX-Linux-Player.git
+cd CM-EX-Linux-Player
+python3 -m venv venv
+venv/bin/pip install -r requirements-dev.txt
+venv/bin/pip install -r requirements-ndi.txt   # optional NDI support
 ```
 
-Update these important settings:
-- `player.id`: Unique ID for this player
-- `player.name`: Display name
-- `api.base_url`: URL of your CMS API server
-
-### 4. Create Cache Directory
+## Configure
 
 ```bash
-mkdir -p /tmp/signage-cache
+cp config.yaml.example config.yaml
+nano config.yaml        # set cms_url
 ```
 
-Update `cache.directory` in `config.yaml` to `/tmp/signage-cache`
+`cms_url` is the only required setting. The player registers itself: on first
+start it shows a registration code (and a Connect:EX QR code) to approve in
+CM:EX under Players.
 
-## Running
-
-### Start the Player
+## Run
 
 ```bash
-python3 main.py
+venv/bin/python main.py
 ```
 
-The player will:
-1. Connect to the API server
-2. Send heartbeat
-3. Wait for playlist assignment
-4. Start playback when playlist is received
+State lives in `~/.config/signage-player/` (identity, cache, offline playlist).
+Delete `state.json` there to register the screen again.
 
-### Test Without API Server
+## Try it without a CMS
 
-Create a test playlist:
+`tests/fake_cms.py` serves the CM:EX player contract with a folder of media
+files as the playlist:
 
 ```bash
-python3 dev_tools.py create-test-playlist test_playlist.json
+venv/bin/python tests/fake_cms.py --port 8000 --media ~/Videos/test &
+# config.yaml: cms_url: "http://127.0.0.1:8000"
+venv/bin/python main.py
+curl -X POST http://127.0.0.1:8000/_admin/approve          # approve the code
+curl -X POST http://127.0.0.1:8000/_admin/command \
+     -d '{"command":"seek","command_id":"k1","command_args":{"position":5}}'
+curl http://127.0.0.1:8000/_admin/acks                     # what the player acknowledged
 ```
 
-Edit `test_playlist.json` to point to real media files on your system, then modify `main.py` to load this local playlist instead of fetching from the API.
-
-## Testing
-
-Run the test suite:
+## Test
 
 ```bash
 ./run_tests.sh
 ```
 
+The suite needs no mpv, display or browser.
+
 ## Troubleshooting
 
-### "Cannot connect to API"
-
-- Verify API server is running
-- Check `api.base_url` in configuration
-- Test with: `curl http://your-api-server:8000/api/v1/health`
-
-### "No video output"
-
-- Set DISPLAY: `export DISPLAY=:0`
-- Check mpv works: `mpv /path/to/test-video.mp4`
-- Verify X server is running
-
-### "python-mpv not found"
-
-```bash
-pip3 install python-mpv
-```
-
-If that fails, install libmpv development files first:
-```bash
-sudo apt-get install libmpv-dev  # Ubuntu/Debian
-sudo dnf install mpv-libs-devel  # Fedora/RHEL
-```
-
-## Next Steps
-
-- Configure systemd service for automatic startup
-- Set up network share for content
-- Configure playlist in web portal
-- Assign playlist to player
-
-See [README.md](README.md) for complete documentation.
+- **No video output:** check `DISPLAY` (`echo $DISPLAY`) and that `mpv some-video.mp4` works.
+- **`python-mpv` cannot find libmpv:** install `libmpv2` (Debian/Ubuntu) or `mpv-libs` (Fedora), then `sudo ldconfig`.
+- **Templates or web pages don't show:** install Chromium (`chromium` or `chromium-browser`).
+- **Logs:** the player logs to stdout; under systemd use `journalctl -u signage-player -f`.
