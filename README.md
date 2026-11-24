@@ -453,6 +453,12 @@ Plus does: triggers (CMS command or touch), scenes with attractors and layouts,
 retrigger policies, `then` / back history, idle return and scheduled home
 scenes in the install's timezone.
 
+**Ubuntu desktop / Wayland.** The player stays on X11 through XWayland and finds
+the session's auth file itself at every start, so stock Ubuntu (GNOME on
+Wayland, snap Chromium) works. Install with `--autologin` so the screen reaches
+its desktop unattended after a reboot:
+`sudo bash install.sh --cms https://cms.example --autologin`.
+
 **Live capture.** `show_capture` shows a USB/UVC camera or HDMI grabber full
 screen (template capture elements too), through the browser's camera access.
 DeckLink is not supported on Linux.

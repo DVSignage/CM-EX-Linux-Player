@@ -2,6 +2,33 @@
 
 All notable changes to the CM:EX Linux Player.
 
+## [2.1.1] - 2026-11-24
+
+Checked against the real CM:EX server: 16 real template definitions, the
+interactive walls they carry, the CMS's own render page, and the inventory a
+2.1.0 player already reported.
+
+### Added
+- Native `web` elements (embedded pages) in templates, and the template
+  background image (`background_image_id`).
+- Ubuntu desktop / Wayland: the player waits for the desktop session, finds
+  the XWayland auth file at every start (its name changes at each login),
+  keeps Chromium on X11, and keeps GNOME from blanking, locking or showing
+  notification banners. `install.sh --autologin` logs the desktop user in at
+  boot (GDM / LightDM).
+- Preview frames taken from Chromium itself (DevTools, loopback only), so
+  previews work where an X screen grab is black (XWayland).
+- Remote-access inventory: service state (running / stopped / absent),
+  package versions, CM:EX tool ids (realvnc, wayvnc, x11vnc, tigervnc...).
+- Real template definitions (scrubbed) as test fixtures.
+
+### Fixed
+- Template rendering matched to the CMS render page: canvas colour from
+  `background_color`, text `verticalAlign` and padding, a "No image"
+  placeholder, RSS `speedPxS`, `separator`, `backgroundOpacity`, `showImages`
+  and the CMS's row and ticker styling.
+- SSH key-only logins were reported with an auth value the CMS does not know.
+
 ## [2.1.0] - 2026-11-23
 
 The rest of the DVSI Plus CMX player's feature set. What is on screen is now
