@@ -22,19 +22,37 @@ CMX.template = (() => {
   }
 
   // ------------------------------------------------------------------ elements
+  // Text as the CMS render draws it: a flex box (vertical alignment) with 4px 8px padding
+  // and a span the full width; line height is a multiplier of the font size.
+  const VALIGN = { top: "flex-start", middle: "center", center: "center", bottom: "flex-end" };
   function buildText(e) {
     const p = e.props, node = document.createElement("div");
     node.className = "el text";
     const inner = document.createElement("div");
     const fs = clamp(num(p.fontSize, 24), 8, 400);
-    Object.assign(inner.style, {
+    Object.assign(node.style, {
+      background: p.backgroundColor || "transparent", padding: "4px 8px",
+      alignItems: VALIGN[(p.verticalAlign || "").toLowerCase()] || "center",
       fontSize: `${fs}px`, color: p.color || "#fff", textAlign: ALIGN[(p.align || "").toLowerCase()] || "left",
-      fontFamily: p.fontFamily || "", fontWeight: p.fontWeight || "normal",
-      lineHeight: num(p.lineHeight, 0) > 0 ? `${num(p.lineHeight, 0) * fs}px` : "normal",
+      fontFamily: p.fontFamily || "Arial, sans-serif", fontWeight: p.fontWeight || "normal",
+      lineHeight: num(p.lineHeight, 0) > 0 ? String(num(p.lineHeight, 0)) : "normal",
     });
     inner.textContent = p.content || "";
-    node.style.background = p.backgroundColor || "transparent";
     node.appendChild(inner);
+    return node;
+  }
+
+  // An embedded page (the CMS's `web` element): a borderless iframe, see-through when asked.
+  function buildWeb(e) {
+    const node = document.createElement("div");
+    node.className = "el web";
+    if (!e.src) return node;
+    const f = document.createElement("iframe");
+    f.src = e.src;
+    f.setAttribute("allow", e.props.allow || "autoplay; fullscreen");
+    if (e.props.transparent) f.setAttribute("allowtransparency", "true");
+    f.style.cssText = `position:absolute;inset:0;width:100%;height:100%;border:none;background:${e.props.transparent ? "transparent" : "#fff"}`;
+    node.appendChild(f);
     return node;
   }
 
@@ -49,7 +67,13 @@ CMX.template = (() => {
   function mediaSurface(payload, e, url, kind) {
     const p = e.props;
     let s;
-    if (!url) { s = document.createElement("div"); s.className = "surf"; return s; }
+    if (!url) {
+      // the CMS render's placeholder for an element with no media
+      s = document.createElement("div"); s.className = "surf";
+      s.style.cssText = "display:flex;align-items:center;justify-content:center;background:#333;color:#999;font-size:14px";
+      s.textContent = e.type === "video" ? "No video" : "No image";
+      return s;
+    }
     if (kind === "image" || e.type === "image") {
       s = document.createElement("img"); s.src = url;
     } else {
@@ -123,6 +147,7 @@ CMX.template = (() => {
       case "rss": node = buildRss(e); break;
       case "trigger_zone": node = nested ? document.createElement("div") : CMX.wall.buildZone(payload, e); break;
       case "template": node = buildNested(payload, e); break;
+      case "web": node = buildWeb(e); break;
       default: return null;
     }
     node.classList.add("el");
@@ -133,6 +158,15 @@ CMX.template = (() => {
   }
 
   // ------------------------------------------------------------------ RSS
+  // backgroundOpacity (0-100) applied to a #rgb / #rrggbb colour; other colours as they are
+  function withOpacity(color, opacity) {
+    if (!color) return "transparent";
+    const o = num(opacity, 100);
+    const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(color);
+    if (!m || o >= 100) return color;
+    let h = m[1]; if (h.length === 3) h = h.split("").map((c) => c + c).join("");
+    return `rgba(${parseInt(h.slice(0, 2), 16)},${parseInt(h.slice(2, 4), 16)},${parseInt(h.slice(4, 6), 16)},${clamp(o, 0, 100) / 100})`;
+  }
   const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
   function friendlyDate(s, fmt) {
     const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s || "");
@@ -146,12 +180,15 @@ CMX.template = (() => {
     const p = e.props, node = document.createElement("div");
     node.className = "el rss";
     const fs = clamp(num(p.fontSize, 28), 8, 400);
-    Object.assign(node.style, { background: p.backgroundColor || "transparent", color: p.color || "#fff", fontSize: `${fs}px`,
+    Object.assign(node.style, { background: withOpacity(p.backgroundColor, p.backgroundOpacity), color: p.color || "#fff", fontSize: `${fs}px`,
       fontFamily: p.fontFamily || "", fontWeight: p.fontWeight || "normal", textAlign: ALIGN[(p.align || "").toLowerCase()] || "left" });
     const mode = (p.mode || "ticker").toLowerCase() === "list" ? "list" : "ticker";
     const maxItems = Math.max(1, num(p.maxItems, mode === "list" ? 8 : 25));
     const itemS = Math.max(2, num(p.itemDurationS, 8));
-    const speed = Math.max(10, num(p.speed, 90));
+    const speed = Math.max(10, num(p.speedPxS, num(p.speed, 90)));
+    const sep = p.separator != null && p.separator !== "" ? String(p.separator) : " • ";
+    const showImages = p.showImages === true;
+    const reverse = (p.animation || "") === "scroll-reverse";
     const showTs = p.showTimestamps !== false;
     const showSummary = p.showSummary !== false && p.showDescription !== false;
     let lastKey = "", page = 0, pageTimer = null, items = [];
@@ -159,10 +196,11 @@ CMX.template = (() => {
     function renderTicker() {
       node.innerHTML = "";
       node.style.display = "flex"; node.style.alignItems = "center";
-      node.style.maskImage = node.style.webkitMaskImage = "linear-gradient(90deg, transparent, #000 6%, #000 94%, transparent)";
+      node.style.maskImage = node.style.webkitMaskImage = "linear-gradient(to right, transparent 0, #000 3%, #000 97%, transparent 100%)";
       const track = document.createElement("div");
       track.style.whiteSpace = "nowrap"; track.style.display = "inline-block"; track.style.willChange = "transform";
-      const one = items.slice(0, maxItems).map((it) => `<span>${CMX.esc(it.title)}</span><span style="opacity:.6;padding:0 1em">•</span>`).join("");
+      // a separator after EVERY item, as the CMS markup, so copies never collide
+      const one = items.slice(0, maxItems).map((it) => `<span>${CMX.esc(it.title)}</span><span style="opacity:.55;padding:0 .6em">${CMX.esc(sep)}</span>`).join("");
       track.innerHTML = `<span class="copy">${one}</span>`;
       node.appendChild(track);
       const copy = track.querySelector(".copy");
@@ -171,7 +209,8 @@ CMX.template = (() => {
       track.innerHTML += `<span class="copy">${copy.innerHTML}</span>`;
       const w = copy.offsetWidth;
       track.animate([{ transform: "translateX(0)" }, { transform: `translateX(${-w}px)` }],
-        { duration: Math.max(1000, (w / speed) * 1000), iterations: Infinity, easing: "linear" });
+        { duration: Math.max(1000, (w / speed) * 1000), iterations: Infinity, easing: "linear",
+          direction: reverse ? "reverse" : "normal" });
     }
 
     function renderListPage() {
@@ -183,11 +222,14 @@ CMX.template = (() => {
       const rowH = e.height / Math.max(1, Math.min(maxItems, slice.length || 1));
       slice.forEach((it, i) => {
         const row = document.createElement("div");
-        Object.assign(row.style, { padding: `${fs * 0.2}px ${inset}px`, height: `${rowH}px`, overflow: "hidden",
+        // the CMS render's row: title / summary / date, a hairline between rows
+        Object.assign(row.style, { display: "flex", flexDirection: "column", gap: ".15em", padding: `.45em ${inset}px`,
+          height: `${rowH}px`, overflow: "hidden", borderBottom: i < slice.length - 1 ? "1px solid rgba(255,255,255,.12)" : "0",
           opacity: "0", transform: "translateY(14px)", transition: "opacity 450ms ease, transform 450ms ease" });
         const lines = rowH >= 4.2 * fs ? 2 : (rowH >= 3.2 * fs ? 1 : 0);
-        row.innerHTML = `<div style="font-weight:700">${CMX.esc(it.title)}</div>` +
-          (showSummary && lines && it.summary ? `<div style="font-size:.8em;opacity:.75;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:${lines}">${CMX.esc(it.summary)}</div>` : "") +
+        row.innerHTML = (showImages && it.image_url ? `<img src="${CMX.esc(it.image_url)}" alt="" style="width:100%;max-height:40%;object-fit:cover;border-radius:4px;margin-bottom:.25em">` : "") +
+          `<div style="font-weight:600;line-height:1.25">${CMX.esc(it.title)}</div>` +
+          (showSummary && lines && it.summary ? `<div style="font-size:.8em;opacity:.75;line-height:1.3;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:${lines}">${CMX.esc(it.summary)}</div>` : "") +
           (showTs && it.published ? `<div style="font-size:.7em;opacity:.55">${CMX.esc(friendlyDate(it.published, p.dateFormat))}</div>` : "");
         node.appendChild(row);
         setTimeout(() => { row.style.opacity = "1"; row.style.transform = "none"; }, 30 + i * 70);
@@ -240,7 +282,11 @@ CMX.template = (() => {
     CMX.showSurface("template");
     cur = { payload: m, canvas: document.createElement("div"), els: new Map(), videos: new Set(), rss: [], captures: [], scale: 1 };
     cur.canvas.className = "canvas";
-    cur.canvas.style.background = "#000";
+    // as the CMS render: background_color (black when empty) under the background image
+    cur.canvas.style.backgroundColor = m.background || "#000";
+    const bg = mediaUrl(m, m.background_image);
+    if (bg) Object.assign(cur.canvas.style, { backgroundImage: `url("${bg}")`, backgroundSize: "cover",
+      backgroundPosition: "center", backgroundRepeat: "no-repeat" });
     root.appendChild(cur.canvas);
     layout();
     for (const e of m.elements) { const node = build(m, e, false); if (node) cur.canvas.appendChild(node); }

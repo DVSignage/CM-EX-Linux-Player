@@ -1,0 +1,84 @@
+{
+ "id": "f4ce15fd-7201-47a6-a40b-b820fe337a1b",
+ "width": 1920,
+ "height": 1080,
+ "background_color": "#FFFFFF",
+ "background_image_id": "f3089a23-4db2-42b6-a76f-8e39134d651c",
+ "elements": [
+  {
+   "id": "9c6e37b6-7151-4b7a-a0b2-9b0a2af0f62e",
+   "type": "image",
+   "label": null,
+   "x": 0,
+   "y": 0,
+   "width": 1920,
+   "height": 600,
+   "rotation": 0,
+   "zIndex": 0,
+   "props": {
+    "objectFit": "cover",
+    "contentId": "aad70dd0-2aad-4e11-9b26-e2c9ed7f651a"
+   }
+  },
+  {
+   "id": "c5473096-ebbe-40e2-957f-42ec0a91c796",
+   "type": "text",
+   "label": null,
+   "x": 96,
+   "y": 620,
+   "width": 1728,
+   "height": 235,
+   "rotation": 0,
+   "zIndex": 1,
+   "props": {
+    "content": "Sample text 1",
+    "fontSize": 162,
+    "fontWeight": 700,
+    "color": "#000000",
+    "align": "left",
+    "maxChars": 15
+   }
+  },
+  {
+   "id": "87f63684-c8a1-4373-bc71-63d31c805e3b",
+   "type": "text",
+   "label": null,
+   "x": 96,
+   "y": 876,
+   "width": 1728,
+   "height": 122,
+   "rotation": 0,
+   "zIndex": 1,
+   "props": {
+    "content": "Sample text 2",
+    "fontSize": 81,
+    "fontWeight": 500,
+    "color": "#000000",
+    "align": "left",
+    "maxChars": 30
+   }
+  },
+  {
+   "id": "bdd72c89-69fe-441f-9fd4-ee50815399aa",
+   "type": "text",
+   "label": null,
+   "x": 96,
+   "y": 1019,
+   "width": 1728,
+   "height": 61,
+   "rotation": 0,
+   "zIndex": 1,
+   "props": {
+    "content": "Sample text 3",
+    "fontSize": 54,
+    "fontWeight": 400,
+    "color": "#000000",
+    "align": "left",
+    "maxChars": 30
+   }
+  }
+ ],
+ "interaction": null,
+ "timezone": "Asia/Manila",
+ "name": "background image"
+}

@@ -26,7 +26,7 @@ from .wallhost import canonical_keys
 
 log = logging.getLogger("player")
 
-KNOWN_TYPES = {"text", "panel", "image", "video", "capture", "rss", "trigger_zone", "template"}
+KNOWN_TYPES = {"text", "panel", "image", "video", "capture", "rss", "trigger_zone", "template", "web"}
 PATCHABLE = {"image", "video", "text", "capture", "rss"}
 MEDIA_KEYS = ("contentId", "content_id", "contentID", "mediaId", "media_id", "assetId", "asset_id")
 DEVICE_KEYS = ("deviceLabel", "device_label", "deviceId", "device_id", "label", "capture_device_label")
@@ -165,6 +165,8 @@ class TemplateBuilder:
             elif etype == "capture":
                 el["device"] = device_label(props)
                 el["audio"] = capture_audio(props)
+            elif etype == "web":
+                el["src"] = str(props.get("src") or props.get("url") or "")
             elif etype == "template":
                 el["nested"] = await self._nested(props, depth, chain)
             if etype in ("text", "image", "video", "panel"):
@@ -172,10 +174,14 @@ class TemplateBuilder:
                 if tap is not None:
                     el["tap_trigger"] = tap
             out.append(el)
+        # The canvas background, as the CMS render draws it: background_color
+        # (black when empty) under background_image_id, cover / centred.
+        bg_image = await self._media_for(definition.get("background_image_id"), "image")
         return {
             "width": int(_num(definition.get("width"), 1920)) or 1920,
             "height": int(_num(definition.get("height"), 1080)) or 1080,
             "background": definition.get("background_color"),
+            "background_image": bg_image,
             "timezone": definition.get("timezone"),
             "elements": out,
         }
