@@ -2,6 +2,18 @@
 
 All notable changes to the CM:EX Linux Player.
 
+## [2.3.0] - 2026-11-24
+
+### Added
+- NDI output that actually sends the screen: frames from an X grab (X11) or
+  a Chromium screencast (Wayland), re-sent at a steady `ndi.fps`. Switched on
+  by `ndi.output` or by the CMS (`ndi_broadcast_active` / `ndi_broadcast_name`
+  on the heartbeat, start/stop_ndi_broadcast), with DVSI Plus's rule: a CMS
+  "off" stops only a broadcast the CMS started.
+
+### Fixed
+- `start_ndi_broadcast` created an NDI sender that never received a frame.
+
 ## [2.2.0] - 2026-11-24
 
 ### Added
