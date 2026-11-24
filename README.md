@@ -378,6 +378,7 @@ cmx/
 ├── screens.py          # PNG screens for the mpv fallback
 ├── browser.py          # a separate Chromium window (sites that refuse framing)
 ├── lan_api.py          # control API on port 8083 (LAN sensors, controllers)
+├── ndi_out.py          # this screen as an NDI source
 ├── local_api.py        # local API on port 8081
 └── config.py           # config.yaml, paths, state.json
 ndi/engine.py           # optional NDI receive/send
@@ -469,6 +470,14 @@ preview routes are for this machine only and need `X-Local-Key` (the key in
 ```bash
 curl -X POST http://SCREEN-IP:8083/api/trigger -H 'X-Trigger-Key: …' -d '{"command":"trigger","id":3}'
 ```
+
+**NDI output.** The screen can be published as an NDI source: switch it on
+locally (`ndi.output: true`) or from the CMS (`ndi_broadcast_active`, or the
+start/stop broadcast commands). As on DVSI Plus, a CMS "off" stops only a
+broadcast the CMS started, and the CMS's name applies while it is asking. On an
+X11 session the whole display is sent; on Wayland the renderer page itself
+(Chromium screencast). Needs `pip install -r requirements-ndi.txt`; expect
+noticeable CPU at 1080p 30 fps on small boards — lower `ndi.fps` there.
 
 **Ubuntu desktop / Wayland.** The player stays on X11 through XWayland and finds
 the session's auth file itself at every start, so stock Ubuntu (GNOME on

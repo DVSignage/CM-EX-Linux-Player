@@ -42,6 +42,13 @@ lan_api:
   enabled: false
   trigger_key: ""
 
+# NDI output (optional, needs requirements-ndi.txt): publish this screen as an
+# NDI source. The CMS can also switch it on (and rename it) for this player.
+ndi:
+  output: false
+  output_name: ""     # empty: "CMX <hostname>"
+  fps: 30
+
 # Cache (optional): how many recent playlists stay cached, so switching back
 # to one needs no re-download (1-100)
 cache:

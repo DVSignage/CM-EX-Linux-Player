@@ -42,6 +42,7 @@ from .interaction import InteractionEngine, resolve_zone, wall_command_refusal
 from .items import TEMPLATE, WEB, Item, classify
 from .kiosk import Kiosk
 from .lan_api import LanApiServer
+from . import ndi_out
 from .local_api import PORT as LOCAL_API_PORT, LocalApiServer, load_or_create_key
 from .playback import PAUSED, PLAYING, STOPPED, PlaylistEngine
 from .preview import PreviewPusher, encode_jpeg
@@ -207,6 +208,10 @@ class Player:
         self.ndi_sources: List[dict] = []
         self._ndi_receiver = ndi_engine.NDIReceiver() if ndi_engine else None
         self._ndi_sender = ndi_engine.NDISender() if ndi_engine else None
+        self.ndi_output = ndi_out.NdiOutput(self._ndi_sender, self._make_ndi_source, settings.ndi_fps)
+        self._cms_ndi: Optional[bool] = None
+        self._cms_ndi_name: Optional[str] = None
+        self._ndi_refused: Optional[tuple] = None
         self.inventory = inv.InventoryReporter(paths.inventory_state)
 
     # ------------------------------------------------------------------
@@ -344,6 +349,8 @@ class Player:
             self.mpv.initialise(loop)
         self.surface.set_volume(self.volume, self.muted)
         self.surface.clear_osd()
+        if self.settings.ndi_output:
+            self._apply_ndi_output()
 
         if not self.cms_url:
             log.warning("No CMS address yet — showing the setup screen.")
@@ -373,6 +380,7 @@ class Player:
             await self.kiosk.stop()
         if self.renderer is not None:
             self.renderer.stop()
+        self.ndi_output.stop()
         if self._ndi_receiver:
             self._ndi_receiver.stop()
         if self._ndi_sender:
@@ -699,9 +707,9 @@ class Player:
             "av_offset_ms": None,
         }
         body.update(metrics())
-        if self._ndi_sender and self._ndi_sender.active:
+        if self.ndi_output.active:
             body["ndi_broadcast_active"] = True
-            body["ndi_broadcast_name"] = self._ndi_sender.source_name
+            body["ndi_broadcast_name"] = self.ndi_output.name
         if self._ndi_receiver and self._ndi_receiver.active:
             body["ndi_receive_active"] = True
             body["ndi_receive_source"] = self._ndi_receiver.source_name
@@ -919,6 +927,12 @@ class Player:
                 else:
                     await self.engine.play()
                 self._last_blank = blank
+        if "ndi_broadcast_active" in data:
+            want = try_read_bool(data.get("ndi_broadcast_active"))
+            name = data.get("ndi_broadcast_name") if isinstance(data.get("ndi_broadcast_name"), str) else None
+            # a rename is a change: the name is how other systems find this source
+            if want is not None and (want != self._cms_ndi or (want and name != self._cms_ndi_name)):
+                await self._set_cms_ndi(want, name)
         if data.get("desired_brightness") is not None and not self._brightness_logged:
             log.info(f"desired_brightness={data['desired_brightness']} (no backlight control on this player)")
             self._brightness_logged = True
@@ -973,6 +987,38 @@ class Player:
         self.wall, self.wall_host, self._wall_item = engine, host, item
         engine.start()
         log.info(f"[WALL] interactive template {item.template_id}: scene '{engine.active_scene_id}'")
+
+    # -- NDI output -------------------------------------------------------------
+
+    def _make_ndi_source(self):
+        """Where the NDI frames come from: the whole X display on X11, the
+        renderer page itself (Chromium screencast) on Wayland where an X grab
+        is black, mpv's own picture in mpv-only mode on Wayland."""
+        wayland = sys.platform.startswith("linux") and display.session_type() == "wayland"
+        if wayland and self.page_mode and self.renderer is not None:
+            return ndi_out.ScreencastSource(self.renderer.url)
+        if wayland and self.mpv is not None:
+            return ndi_out.MpvSource(self.mpv)
+        return ndi_out.XGrabSource(self.settings.display)
+
+    async def _set_cms_ndi(self, want: bool, name: Optional[str]) -> None:
+        self._cms_ndi, self._cms_ndi_name = want, name
+        await asyncio.to_thread(self._apply_ndi_output)
+
+    def _apply_ndi_output(self):
+        """Start, rename or stop the output by NdiOutputPolicy: the local setting
+        or the CMS may turn it on; a CMS "off" stops only what the CMS started."""
+        on, name = ndi_out.decide(self.settings.ndi_output, self.settings.ndi_output_name or ndi_out.default_name(),
+                                  self._cms_ndi, self._cms_ndi_name)
+        if not on:
+            self.ndi_output.stop()
+            self._ndi_refused = None
+            return True, "not broadcasting"
+        ok, msg = self.ndi_output.start(name)
+        if not ok and self._ndi_refused != (on, name):
+            log.warning(f"[NDI OUT] cannot broadcast as '{name}': {msg}")
+        self._ndi_refused = None if ok else (on, name)
+        return ok, msg
 
     # -- the control API on 8083 (its own thread → this loop) -----------------
 
@@ -1190,12 +1236,10 @@ class Player:
                 await asyncio.to_thread(self._ndi_receiver.start, name, ndi_crop)
 
         elif cmd == "start_ndi_broadcast":
-            if self._ndi_sender:
-                self._ndi_sender.start(a.get("ndi_broadcast_name") or f"{self.player_id}-Output")
+            await self._set_cms_ndi(True, a.get("ndi_broadcast_name") or a.get("name"))
 
         elif cmd == "stop_ndi_broadcast":
-            if self._ndi_sender:
-                self._ndi_sender.stop()
+            await self._set_cms_ndi(False, None)
 
     @staticmethod
     def _duration(a: dict) -> float:

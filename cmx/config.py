@@ -105,12 +105,16 @@ class Settings:
     edge_url: str = ""
     lan_triggers: bool = False      # the control API on 8083 listens on the LAN, not only loopback
     trigger_key: str = ""           # X-Trigger-Key required from LAN / browser callers when set
+    ndi_output: bool = False        # publish this screen as an NDI source (the CMS can also ask)
+    ndi_output_name: str = ""       # empty: "CMX <hostname>"
+    ndi_fps: int = 30
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "Settings":
         pb = cfg.get("playback") or {}
         cache = cfg.get("cache") or {}
         lan = cfg.get("lan_api") or {}
+        ndi = cfg.get("ndi") or {}
 
         def flag(v, default):
             if isinstance(v, bool):
@@ -140,7 +144,17 @@ class Settings:
             edge_url=str(cfg.get("edge_url") or "").strip().rstrip("/"),
             lan_triggers=flag(lan.get("enabled"), False),
             trigger_key=str(lan.get("trigger_key") or ""),
+            ndi_output=flag(ndi.get("output"), False),
+            ndi_output_name=str(ndi.get("output_name") or "").strip(),
+            ndi_fps=_int_or(ndi.get("fps"), 30),
         )
+
+
+def _int_or(v, default: int) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
 
 
 def load_config(search: Optional[list] = None) -> dict:
