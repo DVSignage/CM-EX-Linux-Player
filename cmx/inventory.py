@@ -43,13 +43,20 @@ MIN_GAP = 900.0
 LIB_SECTIONS = {"libs", "oldlibs", "libdevel", "debug", "kernel", "localization", "fonts", "doc"}
 
 REMOTE_TOOLS = [
-    # (tool, display name, process names, systemd units, default ports)
-    ("ssh", "OpenSSH server", ["sshd"], ["ssh", "sshd"], [22]),
-    ("rdp", "xrdp", ["xrdp"], ["xrdp"], [3389]),
-    ("vnc", "VNC server", ["x11vnc", "Xvnc", "vino-server", "wayvnc", "Xtigervnc"], ["x11vnc", "vncserver"], [5900]),
-    ("anydesk", "AnyDesk", ["anydesk"], ["anydesk"], [7070]),
-    ("teamviewer", "TeamViewer", ["teamviewerd"], ["teamviewerd"], [5938]),
-    ("rustdesk", "RustDesk", ["rustdesk"], ["rustdesk"], [21118]),
+    # (tool id, display name, process names, systemd units, default ports, packages)
+    # Ids follow CM:EX's list where one exists (rdp, realvnc, teamviewer, anydesk,
+    # rustdesk); a tool outside it keeps its own id.
+    ("ssh", "OpenSSH server", ["sshd"], ["ssh", "sshd"], [22], ["openssh-server"]),
+    ("rdp", "xrdp", ["xrdp"], ["xrdp"], [3389], ["xrdp"]),
+    ("realvnc", "RealVNC Server", ["vncserver-x11-core", "vncserver-x11-serviced", "vncserver-virtuald"],
+     ["vncserver-x11-serviced"], [5900], ["realvnc-vnc-server"]),
+    ("wayvnc", "wayvnc", ["wayvnc"], ["wayvnc"], [5900], ["wayvnc"]),
+    ("x11vnc", "x11vnc", ["x11vnc"], ["x11vnc"], [5900], ["x11vnc"]),
+    ("tigervnc", "TigerVNC", ["Xtigervnc", "Xvnc"], [], [5901], ["tigervnc-standalone-server", "tigervnc-server"]),
+    ("vino", "Vino", ["vino-server"], [], [5900], ["vino"]),
+    ("anydesk", "AnyDesk", ["anydesk"], ["anydesk"], [7070], ["anydesk"]),
+    ("teamviewer", "TeamViewer", ["teamviewerd"], ["teamviewerd"], [5938], ["teamviewer"]),
+    ("rustdesk", "RustDesk", ["rustdesk"], ["rustdesk"], [21118], ["rustdesk"]),
 ]
 
 
@@ -109,21 +116,59 @@ def apps_hash(apps: List[dict]) -> str:
     return "sha256:" + hashlib.sha256(lines.encode("utf-8")).hexdigest()
 
 
-def _ssh_details() -> dict:
+def _ssh_details(etc: Path = Path("/etc/ssh")) -> dict:
+    """Ports and whether SSH asks for a password. sshd keeps the FIRST value it
+    reads, and sshd_config includes sshd_config.d/*.conf at its top, so the
+    drop-ins win. Key-only logins are not "none" (open): they are reported as
+    unknown, the CMS vocabulary being password / none / unknown."""
     ports, auth = [], None
-    try:
-        for line in Path("/etc/ssh/sshd_config").read_text(encoding="utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if line.lower().startswith("port "):
+    files = sorted((etc / "sshd_config.d").glob("*.conf")) + [etc / "sshd_config"]
+    for f in files:
+        try:
+            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) < 2 or parts[0].startswith("#"):
+                continue
+            key = parts[0].lower()
+            if key == "port":
                 try:
-                    ports.append(int(line.split()[1]))
-                except (IndexError, ValueError):
+                    ports.append(int(parts[1]))
+                except ValueError:
                     pass
-            if line.lower().startswith("passwordauthentication "):
-                auth = "password" if line.split()[1].lower() == "yes" else "key"
-    except OSError:
-        pass
+            elif key == "passwordauthentication" and auth is None:
+                auth = "password" if parts[1].lower() == "yes" else "unknown"
     return {"ports": ports or [22], "auth": auth or "password"}
+
+
+def package_version(packages: List[str]) -> Optional[str]:
+    for pkg in packages:
+        if shutil.which("dpkg-query"):
+            v = _run(["dpkg-query", "-W", "-f", "${Version}", pkg], timeout=5).strip()
+        elif shutil.which("rpm"):
+            out = _run(["rpm", "-q", "--qf", "%{VERSION}", pkg], timeout=5).strip()
+            v = "" if "not installed" in out else out
+        else:
+            v = ""
+        if v:
+            return v
+    return None
+
+
+def service_state(units: List[str], running: bool) -> str:
+    """running / stopped / absent, the CMS's words for a tool's service."""
+    if running:
+        return "running"
+    if shutil.which("systemctl"):
+        for u in units:
+            state = _run(["systemctl", "is-active", u], timeout=5).strip()
+            if state == "active":
+                return "running"
+            if state in ("inactive", "failed", "activating", "deactivating"):
+                return "stopped"
+    return "absent"
 
 
 def remote_access() -> List[dict]:
@@ -134,19 +179,13 @@ def remote_access() -> List[dict]:
         except Exception:
             pass
     out = []
-    for tool, name, procs, units, ports in REMOTE_TOOLS:
-        active = any(p in running for p in procs)
-        unit = None
-        if not active and shutil.which("systemctl"):
-            for u in units:
-                if _run(["systemctl", "is-active", u], timeout=5).strip() == "active":
-                    active, unit = True, u
-                    break
-        installed = active or any(shutil.which(p) for p in procs)
-        if not installed:
+    for tool, name, procs, units, ports, packages in REMOTE_TOOLS:
+        state = service_state(units, any(p in running for p in procs))
+        version = package_version(packages)
+        if state == "absent" and version is None and not any(shutil.which(p) for p in procs):
             continue
-        entry = {"tool": tool, "name": name, "version": None, "service": unit or (units[0] if active else None),
-                 "ports": ports[:MAX_PORTS], "auth": None, "nla": None}
+        entry = {"tool": tool, "name": name, "version": version, "service": state,
+                 "ports": ports[:MAX_PORTS], "auth": "unknown", "nla": None}
         if tool == "ssh":
             entry.update(_ssh_details())
             entry["ports"] = entry["ports"][:MAX_PORTS]
