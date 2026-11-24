@@ -9,6 +9,7 @@ Behaviour mirrors DVSI Plus `Cmx/CmxPlayerService.cs` and the parts of
 """
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import VERSION
+from . import cdp, display
 from . import faults as F
 from . import inventory as inv
 from .browser import Browser, find_chromium
@@ -298,7 +300,14 @@ class Player:
             except (NotImplementedError, RuntimeError, ValueError):
                 pass
 
-        if not os.environ.get("DISPLAY"):
+        if sys.platform.startswith("linux"):
+            # The service can start before the desktop session; on GNOME/Wayland the
+            # XWayland auth file has a new name at every login (cmx/display.py).
+            info = await display.wait_for_display(self.settings.display)
+            log.info(f"[DISPLAY] {info['session']} session, DISPLAY={info['display']}, "
+                     f"XAUTHORITY={info['xauthority'] or '(none)'}")
+            await asyncio.to_thread(display.keep_desktop_awake)
+        elif not os.environ.get("DISPLAY"):
             os.environ["DISPLAY"] = self.settings.display
         _suppress_desktop_popups()
 
@@ -1796,6 +1805,18 @@ class Player:
             from PIL import Image, ImageGrab
         except ImportError:
             return None
+        window_up = self.page_mode and self.surface.window is not None and self.surface.window.running
+        stream_up = self._wall_task is not None and not self._wall_task.done()
+        if self.page_mode and self.renderer is not None and not window_up and not stream_up:
+            # straight from Chromium: works where an X grab is black (XWayland) or refused
+            jpeg = cdp.capture(self.renderer.url)
+            if jpeg:
+                try:
+                    img = Image.open(io.BytesIO(jpeg))
+                    img.load()
+                    return img
+                except OSError:
+                    pass
         if self.page_mode or (self.mpv is None) or getattr(getattr(self.surface, "browser", None), "running", False):
             try:
                 return ImageGrab.grab(xdisplay=self.settings.display)

@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from .browser import FLAGS, find_chromium, profile_dir_for, root_flags
+from .cdp import PORT as CDP_PORT
 
 log = logging.getLogger("player")
 
 KIOSK_FLAGS = FLAGS + [
+    f"--remote-debugging-port={CDP_PORT}",   # loopback only: preview screenshots (cmx/cdp.py)
     "--use-fake-ui-for-media-stream",        # templates' capture elements: grant the camera
     "--overscroll-history-navigation=0",
     "--disable-pinch",

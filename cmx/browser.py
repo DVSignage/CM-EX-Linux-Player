@@ -36,6 +36,9 @@ FLAGS = [
     "--autoplay-policy=no-user-gesture-required",
     "--check-for-update-interval=31536000",
     "--password-store=basic",
+    # Stay on X11 (XWayland under a Wayland session): one display for the page,
+    # mpv and the multicast wall window, and an auth file the player can find.
+    "--ozone-platform=x11",
 ]
 
 

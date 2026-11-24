@@ -36,6 +36,7 @@ class FakeCms:
         self.acks = []
         self.beats = []
         self.telemetry = []
+        self.preview_frames = []
         self.secrets_seen = []
         self.lock = threading.Lock()
 
@@ -72,6 +73,8 @@ class FakeCms:
                 self.telemetry.extend(events)
             return self._json({"accepted": len(events), "duplicates": 0, "rejected": 0})
         if method == "POST" and p == f"/api/v1/players/{pid}/preview-frame":
+            with self.lock:
+                self.preview_frames.append(body)
             return self._json({"watching": True})
         if p.startswith("/api/v1/content/") and p.endswith("/stream"):
             cid = p.split("/")[4]
