@@ -37,7 +37,7 @@ from .commands import (ENVELOPE_COMMANDS, RESEND, RUNNING, STATE_COMMANDS, Comma
 from .config import Paths, Settings, load_state, save_state, write_json_atomic
 from .edge import CONTROL, EdgeRouter
 from .enrollment import CODE_POLL_CAP, NEW_CODE_RETRY, POLL_INTERVAL, enroll_link, poll_wait
-from .health import address_signature, lan_address_for, metrics
+from .health import address_signature, lan_address_for, metrics, port_holder, port_conflict_message
 from .interaction import InteractionEngine, resolve_zone, wall_command_refusal
 from .items import TEMPLATE, WEB, Item, classify
 from .kiosk import Kiosk
@@ -49,7 +49,7 @@ from .preview import PreviewPusher, encode_jpeg
 from .surface import MpvSurface, PageSurface
 from .telemetry import (CLOUD_TYPES, TelemetryQueue, boot_event, crash_event, edge_event,
                         pending_crash_markers, ts)
-from .templates import TemplateBuilder, patch_definition
+from .templates import TemplateBuilder, av_offset, patch_definition
 from .wall import STREAM_TUNING, crop_filter_normalised, crop_filter_pixel, normalise_crop, stream_url_with_buffers
 from .wallhost import WallHost
 
@@ -79,6 +79,7 @@ COMMAND_LOG_SUMMARY = 30.0
 PLAYLIST_FETCH_FAULT_AFTER = 3
 PROOF_MIN_SECONDS = 0.25
 WEB_PROBE_TTL = 600.0
+PORT_RETRY_INTERVAL = 30.0
 
 
 def _ndi_available() -> bool:
@@ -117,7 +118,7 @@ class Player:
         self.faults = F.PlayerFaults()
         self.gate = CommandGate()
         self.coalescer = Coalescer()
-        self.telemetry = TelemetryQueue(paths.telemetry_queue)
+        self.telemetry = TelemetryQueue(paths.telemetry_queue, on_drop=self._telemetry_dropped)
         self._build_cms()
 
         # Display: the renderer page in a Chromium kiosk, or mpv alone.
@@ -182,6 +183,9 @@ class Player:
         self._rss_feeds: Set[str] = set()
         self._web_probe_cache: Dict[str, tuple] = {}
         self.capture_devices: List[dict] = []
+        self._live_trim = 0
+        self.av_offset_ms: Optional[int] = None
+        self.av_hold_ms: Optional[int] = None
 
         # Walls and proof of play
         self.wall: Optional[InteractionEngine] = None
@@ -202,6 +206,8 @@ class Player:
         self._overlay_timer: Optional[asyncio.TimerHandle] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._boot_reported = False
+        self.port_conflicts: Dict[str, dict] = {}     # service -> {port, holder, reported}
+        self._port_task: Optional[asyncio.Task] = None
         self.started_at = _utc_now()
         self._started_wall = time.time()
         self.local_ip: Optional[str] = None
@@ -321,8 +327,7 @@ class Player:
         if self._enable_local_api:
             self.local_api = LocalApiServer(self.paths.local_api_key, self._device_info,
                                             self._ndi_source_list, self._snapshot_jpeg)
-            why = self.local_api.start()
-            self.faults.put(F.PORT, F.port_message(LOCAL_API_PORT, why) if why else None)
+            self._bound("local API", self.local_api.port, self.local_api.start())
             self.lan_api = LanApiServer(
                 load_or_create_key(self.paths.local_api_key),
                 lan_enabled=self.settings.lan_triggers, trigger_key=self.settings.trigger_key,
@@ -332,15 +337,12 @@ class Player:
                 ndi_sources=lambda: {"available": _ndi_available(),
                                      "reason": None if _ndi_available() else "NDI runtime (ndi-python) not installed",
                                      "sources": [{"name": s.get("name")} for s in self._ndi_source_list()]},
-                preview_jpeg=self._snapshot_jpeg)
-            why = self.lan_api.start()
-            if why:
-                self.faults.set(F.PORT, F.port_message(self.lan_api.port, why))
+                preview_jpeg=self._snapshot_jpeg,
+                reset_registration=lambda: self._on_loop(self.reset_registration("local API"), 60))
+            self._bound("control API", self.lan_api.port, self.lan_api.start())
 
         if self.renderer is not None:
-            why = self.renderer.start()
-            if why:
-                self.faults.set(F.PORT, F.port_message(self.renderer.port, why))
+            self._bound("renderer page", self.renderer.port, self.renderer.start())
             self.surface.send({"type": "config", "loading_indicator": self.settings.loading_indicator,
                                "music_wave": self.settings.music_wave})
             if self.kiosk is not None:
@@ -351,6 +353,8 @@ class Player:
         self.surface.clear_osd()
         if self.settings.ndi_output:
             self._apply_ndi_output()
+
+        self._port_task = asyncio.ensure_future(self._port_retry_loop())
 
         if not self.cms_url:
             log.warning("No CMS address yet — showing the setup screen.")
@@ -368,7 +372,7 @@ class Player:
 
     async def shutdown(self) -> None:
         log.info("Shutting down...")
-        for t in list(self._routines.values()) + [self._enroll_task, self._wall_task, self._fetch_task]:
+        for t in list(self._routines.values()) + [self._enroll_task, self._wall_task, self._fetch_task, self._port_task]:
             if t and not t.done():
                 t.cancel()
         self.preview.stop()
@@ -587,6 +591,44 @@ class Player:
         self._set_online(True, fetch=False)
         self.spawn_fetch()
 
+    async def reset_registration(self, source: str = "screen") -> str:
+        """Forget this screen's registration (DVSI Plus ResetRegistration): identity,
+        secret, site, cache and the saved server addresses — the connection mode
+        is kept so the setup screen reopens on it. With cms_url in config.yaml
+        the address cannot be forgotten, so a fresh code is shown instead."""
+        log.warning(f"[RESET] registration reset from the {source}")
+        current = asyncio.current_task()
+        for t in list(self._routines.values()) + [self._enroll_task]:
+            if t and not t.done() and t is not current:
+                t.cancel()
+        self._routines = {}
+        self._enroll_task = None
+        self._leave_walls()
+        self.preview.stop()
+        await self.engine.release()
+        self.cache.clear()
+        try:
+            self.paths.offline_playlist.unlink()
+        except OSError:
+            pass
+        for k in ("player_id", "player_secret", "site_id", "site_name"):
+            self.state.pop(k, None)
+        if not self.settings.cms_url:
+            self.state.pop("cms_url", None)
+            self.state.pop("edge_url", None)
+        self._save()
+        self.pending = PendingDownloads()
+        self._gone.clear()
+        self.last_playlist_hash = self.last_content_id = self._last_sent_key = None
+        self.online = None
+        await self.cms.aclose()
+        self._build_cms()
+        if self.cms_url:
+            self._enroll_task = asyncio.ensure_future(self.enroll())
+            return "registration reset — showing a new code"
+        self.surface.show_screen("setup", mode=self.connection_mode, cloud="", edge="")
+        return "registration reset — showing the setup screen"
+
     async def re_enroll(self) -> None:
         """Unregistered (heartbeat 404 or delete_player): drop the identity,
         the cache and the offline copy, and show a fresh code."""
@@ -703,8 +745,8 @@ class Player:
             "ndi_sources": [{"name": s.get("name")} for s in self.ndi_sources if s.get("name")],
             "ndi_supported": _ndi_available(),
             "ndi_reason": None if _ndi_available() else "NDI runtime (ndi-python) not installed",
-            "av_hold_ms": None,
-            "av_offset_ms": None,
+            "av_hold_ms": self.av_hold_ms if self._live_key else None,
+            "av_offset_ms": self.av_offset_ms if self._live_key else None,
         }
         body.update(metrics())
         if self.ndi_output.active:
@@ -988,6 +1030,55 @@ class Player:
         engine.start()
         log.info(f"[WALL] interactive template {item.template_id}: scene '{engine.active_scene_id}'")
 
+    # -- port conflicts ----------------------------------------------------------
+
+    def _bound(self, service: str, port: int, why: Optional[str]) -> None:
+        """Record a port that could not be bound (or that came free)."""
+        if why:
+            if service not in self.port_conflicts:
+                holder = port_holder(port)
+                self.port_conflicts[service] = {"port": port, "holder": holder, "reported": False, "why": why}
+                log.error(f"[PORT] {port_conflict_message(service, port, holder)}")
+        elif service in self.port_conflicts:
+            info = self.port_conflicts.pop(service)
+            log.info(f"[PORT] {service} is listening on port {port} again")
+            if info.get("reported"):
+                self._emit_edge_event("info", "port_conflict_cleared", f"{service} tcp port {port} is free again",
+                                      {"service": service, "port": port, "protocol": "tcp"})
+        self._update_port_fault()
+        self._report_port_conflicts()
+
+    def _update_port_fault(self) -> None:
+        if not self.port_conflicts:
+            self.faults.clear(F.PORT)
+            return
+        service, info = next(iter(self.port_conflicts.items()))
+        msg = port_conflict_message(service, info["port"], info.get("holder"))
+        extra = len(self.port_conflicts) - 1
+        self.faults.set(F.PORT, msg + (f" (+{extra} more port)" if extra else ""))
+
+    def _report_port_conflicts(self) -> None:
+        if not self.player_id:
+            return       # reported once the screen is enrolled
+        for service, info in self.port_conflicts.items():
+            if not info["reported"]:
+                info["reported"] = True
+                self._emit_edge_event("warn", "port_conflict",
+                                      port_conflict_message(service, info["port"], info.get("holder")),
+                                      {"service": service, "port": info["port"], "protocol": "tcp",
+                                       "holder": info.get("holder"), "reason": info.get("why")})
+
+    async def _port_retry_loop(self) -> None:
+        """A port another program held may come free: try again every 30 s."""
+        servers = {"local API": lambda: self.local_api, "control API": lambda: self.lan_api,
+                   "renderer page": lambda: self.renderer}
+        while not self._stop.is_set():
+            await asyncio.sleep(PORT_RETRY_INTERVAL)
+            for service in list(self.port_conflicts):
+                srv = servers.get(service, lambda: None)()
+                if srv is not None:
+                    self._bound(service, srv.port, await asyncio.to_thread(srv.start))
+
     # -- NDI output -------------------------------------------------------------
 
     def _make_ndi_source(self):
@@ -1259,7 +1350,12 @@ class Player:
         if audio is None:
             audio = decklink        # DeckLink audio on, USB off (DVSI defaults)
         key = f"capture:{device_id}:{label}:a{int(bool(audio))}"
+        trim = av_offset(a)
         if key == self._live_key:
+            # the trim is not part of the key: a new value is applied live
+            if trim != self._live_trim:
+                self._live_trim = trim
+                self.surface.send({"type": "capture_trim", "av_offset_ms": trim})
             return
         if decklink:
             log.warning("[CAPTURE] DeckLink capture is not supported on Linux — trying it as a USB device")
@@ -1271,8 +1367,10 @@ class Player:
         self._wall_key = self._ndi_active_key = None
         await self.engine.suspend()
         log.info(f"[CAPTURE] showing {label or device_id or 'the first camera'} (audio {'on' if audio else 'off'})")
+        self._live_trim = trim
         self.surface.send({"type": "capture", "gen": self.surface.gen + 1, "device_label": label,
-                           "device_id": None if decklink else device_id, "audio": bool(audio)})
+                           "device_id": None if decklink else device_id, "audio": bool(audio),
+                           "av_offset_ms": trim})
 
     def _cancel_wall(self) -> None:
         if self._wall_task and not self._wall_task.done():
@@ -1354,6 +1452,8 @@ class Player:
             self.kiosk.alive()
         elif t == "setup":
             asyncio.ensure_future(self._on_setup(msg))
+        elif t == "reset_registration":
+            asyncio.ensure_future(self.reset_registration("screen"))
         elif t == "tap" and self.wall is not None and self.wall.m.policy.touch:
             tid = try_read_int(msg.get("trigger_id"))
             if tid is not None:
@@ -1367,6 +1467,9 @@ class Player:
             devs = msg.get("capture") if isinstance(msg.get("capture"), list) else []
             self.capture_devices = [{"label": d.get("label"), "deviceId": d.get("deviceId")}
                                     for d in devs if isinstance(d, dict)]
+        elif t == "capture_trim":
+            self.av_offset_ms = try_read_int(msg.get("av_offset_ms"))
+            self.av_hold_ms = try_read_int(msg.get("av_hold_ms"))
         elif t == "error":
             log.warning(f"[RENDERER] {msg.get('what')}")
 
@@ -1742,6 +1845,11 @@ class Player:
         self._play_started = now if new is not None else None
         self._attach_wall(new)
 
+    def _telemetry_dropped(self, event: dict) -> None:
+        if event.get("type") == "inventory":
+            log.warning("[INVENTORY] the cloud refused the inventory — reporting daily only from now on")
+            self.inventory.refused((event.get("agent") or {}).get("version"))
+
     def _emit_edge_event(self, level: str, code: str, message: str, detail: dict) -> None:
         if self.player_id:
             self.telemetry.enqueue(edge_event(self.player_id, level, code, message, detail))
@@ -1767,6 +1875,7 @@ class Player:
         if not self._boot_reported:
             self.telemetry.enqueue(boot_event(pid, VERSION, self.started_at, bool(markers)))
             self._boot_reported = True
+        self._report_port_conflicts()
         self._telemetry_kick.set()
 
     async def _flush_telemetry(self) -> None:

@@ -281,6 +281,14 @@ EOF
 
 If you need to register the player with a different CMS, or the player record was deleted:
 
+- **At the screen:** press **Ctrl+Alt+Shift+R**, then **Y** within 10 seconds.
+- **From this machine:**
+  `curl -X POST http://127.0.0.1:8083/api/reset-registration -H "X-Local-Key: $(cat ~/.config/signage-player/local-api.key)"`
+
+Either one clears the registration, cache and offline copy. A player whose
+`config.yaml` sets `cms_url` shows a new enrollment code; otherwise it returns
+to the setup screen. Or by hand:
+
 ```bash
 sudo rm /home/signage/.config/signage-player/state.json
 sudo systemctl restart signage-player
@@ -487,6 +495,10 @@ its desktop unattended after a reboot:
 
 **Live capture.** `show_capture` shows a USB/UVC camera or HDMI grabber full
 screen (template capture elements too), through the browser's camera access.
+An A/V offset (`av_offset_ms`, ±500 ms, on the command or the capture element)
+lines picture and sound up: positive holds the picture back, negative delays
+the sound. A new offset for the device already on screen applies without
+reopening it; the heartbeat reports `av_offset_ms` and `av_hold_ms`.
 DeckLink is not supported on Linux.
 
 **Edge mode.** Control requests and downloads go to the edge server first and
@@ -497,7 +509,12 @@ and player health go to the edge as telemetry.
 **Telemetry.** Boot and crash events, renderer crashes (Chromium is relaunched
 automatically), wall events, edge failover, proof of play and health (edge
 mode), and a machine inventory (OS, remote-access tools, installed apps) daily
-or on change.
+or on change. If the CMS refuses an inventory for good, it is sent once a day
+until the player version changes. A port the player needs (8081, 8083, 8090)
+that another program holds shows in the heartbeat's `error` line ("port
+conflict: control API tcp port 8083 is held by nginx"), is reported as a
+`port_conflict` event, and is retried every 30 s (`port_conflict_cleared` once
+it binds).
 
 **Preview.** When the CMS heartbeat says `preview_watch`, the player pushes
 JPEG frames to `/players/{id}/preview-frame` (640×360 every 2 s, or 960×540

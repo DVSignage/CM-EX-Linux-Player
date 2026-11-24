@@ -184,8 +184,10 @@ Sender = Callable[[List[dict]], Awaitable[httpx.Response]]
 
 
 class TelemetryQueue:
-    def __init__(self, path: Path, cap_: int = QUEUE_CAP, routable=CLOUD_TYPES):
+    def __init__(self, path: Path, cap_: int = QUEUE_CAP, routable=CLOUD_TYPES,
+                 on_drop: Optional[Callable[[dict], None]] = None):
         self.path = path
+        self.on_drop = on_drop   # told about an event the server refused for good
         self.cap = cap_
         self.routable = set(routable)
         self.events: List[dict] = []
@@ -224,6 +226,13 @@ class TelemetryQueue:
         self._enforce_cap()
         self.save()
         return True
+
+    def _dropped(self, event: dict) -> None:
+        if self.on_drop:
+            try:
+                self.on_drop(event)
+            except Exception:
+                pass
 
     def _sendable(self) -> List[dict]:
         return [e for e in self.events if e.get("type") in self.routable]
@@ -267,6 +276,7 @@ class TelemetryQueue:
                     if int(body.get("rejected") or 0) > 0:
                         log.error(f"[TELEMETRY] event rejected and dropped: {batch[0].get('code') or batch[0].get('type')}")
                         self._remove(batch)
+                        self._dropped(batch[0])
                         continue
                     break   # taken by nobody, refused by nobody: try again later
                 self._batch = max(1, len(batch) // 2)
@@ -275,6 +285,7 @@ class TelemetryQueue:
                 if len(batch) == 1:
                     log.error(f"[TELEMETRY] schema refused {batch[0].get('code') or batch[0].get('type')}; dropped it")
                     self._remove(batch)
+                    self._dropped(batch[0])
                     self._batch = MAX_BATCH
                 else:
                     self._batch = max(1, len(batch) // 2)

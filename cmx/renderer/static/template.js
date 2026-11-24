@@ -109,7 +109,7 @@ CMX.template = (() => {
     const hint = document.createElement("div");
     hint.className = "hint";
     node.append(v, hint);
-    const slot = CMX.capture ? CMX.capture.attach(v, hint, e.device, e.audio) : null;
+    const slot = CMX.capture ? CMX.capture.attach(v, hint, e.device, e.audio, null, e.av_offset || 0) : null;
     if (cur && slot) cur.captures.push(slot);
     return node;
   }

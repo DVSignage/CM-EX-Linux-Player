@@ -108,7 +108,7 @@ class LanApiServer:
                  handle_wall: Callable, snapshot: Callable[[], dict], control: Callable[[str], None],
                  device_info: Callable[[], dict], capture_devices: Callable[[], list],
                  ndi_sources: Callable[[], dict], preview_jpeg: Callable[[], Optional[bytes]],
-                 port: int = PORT):
+                 reset_registration: Optional[Callable[[], str]] = None, port: int = PORT):
         self.port = port
         self.lan_enabled = lan_enabled
         self.trigger_key = trigger_key or ""
@@ -120,6 +120,7 @@ class LanApiServer:
         self._capture_devices = capture_devices
         self._ndi_sources = ndi_sources
         self._preview_jpeg = preview_jpeg
+        self._reset_registration = reset_registration
         self._server: Optional[ThreadingHTTPServer] = None
         self.lan_bound = False
 
@@ -229,6 +230,8 @@ class LanApiServer:
                 if method == "POST" and path in ("/api/play", "/api/pause", "/api/restart"):
                     api._control(path[len("/api/"):])
                     return self._json({"status": "success"})
+                if method == "POST" and path == "/api/reset-registration" and api._reset_registration:
+                    return self._json({"status": "success", "message": api._reset_registration()})
                 if method == "GET" and path == "/api/device":
                     return self._json(api._device_info())
                 if method == "GET" and path == "/api/preview/config":

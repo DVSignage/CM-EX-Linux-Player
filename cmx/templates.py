@@ -63,6 +63,23 @@ def capture_audio(props: dict) -> bool:
     return True
 
 
+AV_KEYS = ("av_offset_ms", "av_sync_ms", "avOffsetMs", "audio_delay_ms", "avSyncMs")
+MAX_AV_TRIM = 500
+
+
+def av_offset(props: dict) -> int:
+    """The A/V trim in ms (+ holds the picture, - delays the sound), ±500."""
+    for k in AV_KEYS:
+        v = props.get(k)
+        if v is None or isinstance(v, bool):
+            continue
+        try:
+            return max(-MAX_AV_TRIM, min(MAX_AV_TRIM, int(round(float(v)))))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
 def zone_trigger_id(props: dict) -> Optional[int]:
     t = props.get("triggerId")
     try:
@@ -165,6 +182,7 @@ class TemplateBuilder:
             elif etype == "capture":
                 el["device"] = device_label(props)
                 el["audio"] = capture_audio(props)
+                el["av_offset"] = av_offset(props)
             elif etype == "web":
                 el["src"] = str(props.get("src") or props.get("url") or "")
             elif etype == "template":

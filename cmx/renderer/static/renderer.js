@@ -451,6 +451,24 @@ const CMX = (() => {
   }, 500);
   setInterval(() => post("alive", {}), 2000);
 
+  // Reset registration on the screen: Ctrl+Alt+Shift+R, then Y within 10 s.
+  let resetArmed = null;
+  document.addEventListener("keydown", (ev) => {
+    if (ev.ctrlKey && ev.altKey && ev.shiftKey && (ev.key === "R" || ev.key === "r")) {
+      clearTimeout(resetArmed);
+      overlay({ kind: "reset", opaque: true, title: "Reset this player's registration?",
+                body: "It forgets its CM:EX registration and cached content. Press Y to confirm, any other key to cancel." });
+      resetArmed = setTimeout(() => { resetArmed = null; overlay(null); }, 10000);
+      ev.preventDefault();
+      return;
+    }
+    if (resetArmed) {
+      clearTimeout(resetArmed); resetArmed = null; overlay(null);
+      if (ev.key === "y" || ev.key === "Y") post("reset_registration", {});
+      ev.preventDefault();
+    }
+  });
+
   document.addEventListener("DOMContentLoaded", connect);
 
   return { on, post, state, showSurface, applyVolume, esc, loading, media, fmtTime };

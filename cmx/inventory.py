@@ -234,11 +234,26 @@ class InventoryReporter:
         last = float(self.state.get("last_sent", 0))
         if now - last < MIN_GAP:
             return False
+        version = (body.get("agent") or {}).get("version")
+        if self.state.get("refused_version") and self.state.get("refused_version") == version:
+            return now - last >= FULL_EVERY      # the cloud refused this agent's report: daily only
         changed = fingerprint(body) != self.state.get("fingerprint")
         return changed or now - last >= FULL_EVERY
 
+    def refused(self, version: Optional[str]) -> None:
+        """The cloud refused an inventory: report daily only, until the agent
+        version changes (a newer player may send what the cloud accepts)."""
+        self.state["refused_version"] = version or "?"
+        self._save()
+
     def sent(self, body: dict) -> None:
+        refused = self.state.get("refused_version")
         self.state = {"last_sent": self._clock(), "fingerprint": fingerprint(body)}
+        if refused and refused == (body.get("agent") or {}).get("version"):
+            self.state["refused_version"] = refused
+        self._save()
+
+    def _save(self) -> None:
         try:
             self.state_path.write_text(json.dumps(self.state), encoding="utf-8")
         except OSError:
