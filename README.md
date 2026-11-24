@@ -345,7 +345,7 @@ The player detects a 404 on the next heartbeat, clears its identity, and immedia
 
 The player follows the **DVSI Plus CMX player** (the native Windows port in
 `DVSignage/win-web-wrap`) for its CMS contract and behaviour. What is on screen
-is drawn by a **renderer page** the player serves itself (port 8083, loopback
+is drawn by a **renderer page** the player serves itself (port 8090, loopback
 only) and shows in a Chromium kiosk, so templates, walls and crossfades work
 offline. mpv plays the multicast wall stream, and is the whole display when
 Chromium is not installed (`playback.renderer: mpv` forces that).
@@ -377,6 +377,7 @@ cmx/
 ├── wall.py             # wall crop filters, multicast wall stream settings
 ├── screens.py          # PNG screens for the mpv fallback
 ├── browser.py          # a separate Chromium window (sites that refuse framing)
+├── lan_api.py          # control API on port 8083 (LAN sensors, controllers)
 ├── local_api.py        # local API on port 8081
 └── config.py           # config.yaml, paths, state.json
 ndi/engine.py           # optional NDI receive/send
@@ -452,6 +453,22 @@ screen. `template_patch` changes one element live.
 Plus does: triggers (CMS command or touch), scenes with attractors and layouts,
 retrigger policies, `then` / back history, idle return and scheduled home
 scenes in the install's timezone.
+
+**Control API (port 8083).** The same local API as DVSI Plus, for sensors,
+touch panels and show controllers on the venue network. Wall routes:
+`POST /api/trigger` (`{"command":"trigger","id":3}` or `?id=3`), `/api/scene`
+(`{"scene":"…","stop":true}`), `/api/home`, `/api/back`, `/api/play-content`
+(`{"content_id":"…"}`), `/api/alignment` (`{"enabled":true}`), `/api/patch`
+(`{"element_id":"…","text":"…"}` or `"content_id"`) and `GET /api/interaction`;
+every answer is `{accepted, reason, scene}`. It listens on this machine only
+unless `lan_api.enabled` is true; set `lan_api.trigger_key` and LAN or browser
+callers must send it as `X-Trigger-Key`. Play/pause/restart, device and
+preview routes are for this machine only and need `X-Local-Key` (the key in
+`~/.config/signage-player/local-api.key`).
+
+```bash
+curl -X POST http://SCREEN-IP:8083/api/trigger -H 'X-Trigger-Key: …' -d '{"command":"trigger","id":3}'
+```
 
 **Ubuntu desktop / Wayland.** The player stays on X11 through XWayland and finds
 the session's auth file itself at every start, so stock Ubuntu (GNOME on

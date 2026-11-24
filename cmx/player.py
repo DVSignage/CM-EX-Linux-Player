@@ -41,7 +41,8 @@ from .health import address_signature, lan_address_for, metrics
 from .interaction import InteractionEngine, resolve_zone, wall_command_refusal
 from .items import TEMPLATE, WEB, Item, classify
 from .kiosk import Kiosk
-from .local_api import PORT as LOCAL_API_PORT, LocalApiServer
+from .lan_api import LanApiServer
+from .local_api import PORT as LOCAL_API_PORT, LocalApiServer, load_or_create_key
 from .playback import PAUSED, PLAYING, STOPPED, PlaylistEngine
 from .preview import PreviewPusher, encode_jpeg
 from .surface import MpvSurface, PageSurface
@@ -151,6 +152,7 @@ class Player:
         self.preview = PreviewPusher(self._capture_frame, self._post_frame)
         self._enable_local_api = enable_local_api
         self.local_api: Optional[LocalApiServer] = None
+        self.lan_api: Optional[LanApiServer] = None
 
         self.volume = int(self.state.get("volume", 100))
         self.muted = bool(self.state.get("muted", False))
@@ -316,6 +318,19 @@ class Player:
                                             self._ndi_source_list, self._snapshot_jpeg)
             why = self.local_api.start()
             self.faults.put(F.PORT, F.port_message(LOCAL_API_PORT, why) if why else None)
+            self.lan_api = LanApiServer(
+                load_or_create_key(self.paths.local_api_key),
+                lan_enabled=self.settings.lan_triggers, trigger_key=self.settings.trigger_key,
+                handle_wall=self._lan_wall_threadsafe, snapshot=self._lan_snapshot_threadsafe,
+                control=self._lan_control_threadsafe, device_info=self._device_info,
+                capture_devices=lambda: list(self.capture_devices),
+                ndi_sources=lambda: {"available": _ndi_available(),
+                                     "reason": None if _ndi_available() else "NDI runtime (ndi-python) not installed",
+                                     "sources": [{"name": s.get("name")} for s in self._ndi_source_list()]},
+                preview_jpeg=self._snapshot_jpeg)
+            why = self.lan_api.start()
+            if why:
+                self.faults.set(F.PORT, F.port_message(self.lan_api.port, why))
 
         if self.renderer is not None:
             why = self.renderer.start()
@@ -366,6 +381,8 @@ class Player:
             ndi_engine.cleanup()
         if self.local_api:
             self.local_api.stop()
+        if self.lan_api:
+            self.lan_api.stop()
         self.telemetry.save()
         for m in (self.mpv, self._wall_mpv):
             if m is not None and hasattr(m, "terminate"):
@@ -914,7 +931,7 @@ class Player:
             return cur
         return None
 
-    def _wall_command(self, cmd: str, args: dict):
+    def _wall_command(self, cmd: str, args: dict, source: str = "cms"):
         tpl = self._template_on_screen()
         refusal = wall_command_refusal(args, tpl.template_id if tpl else None)
         if refusal:
@@ -925,14 +942,14 @@ class Player:
             tid = try_read_int(args.get("id") if args.get("id") is not None else args.get("trigger_id"))
             if tid is None:
                 return False, "trigger needs a numeric 'id'"
-            return self.wall.trigger(tid, "cms")
+            return self.wall.trigger(tid, source)
         if cmd == "set_scene":
             target = args.get("scene_id") or args.get("scene")
             if not target:
                 return False, "set_scene needs 'scene_id'"
-            return self.wall.set_scene(str(target), "cms", bool(try_read_bool(args.get("stop"))))
+            return self.wall.set_scene(str(target), source, bool(try_read_bool(args.get("stop"))))
         if cmd == "wall_play":
-            return self.wall.play_content(args.get("content_id") or args.get("contentId"), "cms")
+            return self.wall.play_content(args.get("content_id") or args.get("contentId"), source)
         return self.wall.set_alignment(bool(try_read_bool(args.get("enabled"))))
 
     def _attach_wall(self, item: Optional[Item]) -> None:
@@ -956,6 +973,55 @@ class Player:
         self.wall, self.wall_host, self._wall_item = engine, host, item
         engine.start()
         log.info(f"[WALL] interactive template {item.template_id}: scene '{engine.active_scene_id}'")
+
+    # -- the control API on 8083 (its own thread → this loop) -----------------
+
+    def _on_loop(self, coro, timeout: float = 15.0):
+        if self._loop is None:
+            raise RuntimeError("the player is not running")
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
+
+    async def _lan_wall(self, cmd: str, args: dict):
+        """A wall route from a LAN sensor or controller → (accepted, reason, scene)."""
+        if cmd == "patch":
+            ok, msg = await self._template_patch(args)
+        else:
+            ok, msg = self._wall_command(cmd, args, source="lan")
+        return ok, msg, self.wall.active_scene_id if self.wall else None
+
+    def _lan_wall_threadsafe(self, cmd: str, args: dict):
+        try:
+            return self._on_loop(self._lan_wall(cmd, args))
+        except Exception as e:
+            return False, f"the player could not handle it ({type(e).__name__})", None
+
+    async def _lan_snapshot(self) -> dict:
+        if self.wall is None:
+            tpl = self._template_on_screen()
+            return {"interactive": False, "template_id": tpl.template_id if tpl else None,
+                    "reason": "no interactive template on screen"}
+        snap = self.wall.snapshot()
+        snap["template_id"] = self._wall_item.template_id if self._wall_item else None
+        return snap
+
+    def _lan_snapshot_threadsafe(self) -> dict:
+        try:
+            return self._on_loop(self._lan_snapshot())
+        except Exception:
+            return {"interactive": False, "reason": "the player is not running"}
+
+    async def _lan_control(self, name: str) -> None:
+        if name == "play":
+            await self.engine.play()
+        elif name == "pause":
+            self.engine.pause()
+        elif name == "restart":
+            await self.engine.replay()
+            if self.wall is not None:
+                self.wall.reset()
+
+    def _lan_control_threadsafe(self, name: str) -> None:
+        self._on_loop(self._lan_control(name))
 
     async def _wall_tick_loop(self) -> None:
         while not self._stop.is_set():

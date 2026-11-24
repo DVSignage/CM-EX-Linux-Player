@@ -108,6 +108,17 @@ def test_native_template_wall_trigger_and_patch(tmp_path):
         assert cms.acks[-1]["message"] == "template OTHER is not on screen"
         await p.handle_command({"command": "set_scene", "command_id": "k4", "command_args": {"scene_id": "nope"}})
         assert cms.acks[-1]["message"] == "unknown scene 'nope'"
+
+        # the same wall from a LAN sensor / controller (control API on 8083)
+        await asyncio.sleep(0.35)
+        ok, why, scene = await p._lan_wall("trigger", {"command": "trigger", "id": "1"})
+        assert ok and why.startswith("trigger 1:") and scene == "home"
+        ok, why, scene = await p._lan_wall("set_scene", {"scene": "root", "stop": True})
+        assert ok and why == "scene 'home' (stopped 1)"
+        ok, why, _ = await p._lan_wall("patch", {"element_id": "t1", "text": "From the LAN"})
+        assert ok and why == "patched t1"                       # kind taken from the element
+        snap = await p._lan_snapshot()
+        assert snap["interactive"] is True and snap["template_id"] == "T"
         await p.shutdown()
 
     asyncio.run(go())

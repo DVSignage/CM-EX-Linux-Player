@@ -34,6 +34,14 @@ playback:
   # The animated wave behind the audio Now Playing card
   music_wave: true
 
+# Control API on port 8083 (optional): lets sensors, touch panels and show
+# controllers on the LAN drive interactive walls (/api/trigger, /api/scene...).
+# Off: this machine only. A trigger_key makes LAN and browser callers send it as
+# the X-Trigger-Key header.
+lan_api:
+  enabled: false
+  trigger_key: ""
+
 # Cache (optional): how many recent playlists stay cached, so switching back
 # to one needs no re-download (1-100)
 cache:

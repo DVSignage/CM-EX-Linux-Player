@@ -103,11 +103,14 @@ class Settings:
     music_wave: bool = True
     connection_mode: str = ""       # "cloud" | "edge"; empty = from state (setup screen) or cloud
     edge_url: str = ""
+    lan_triggers: bool = False      # the control API on 8083 listens on the LAN, not only loopback
+    trigger_key: str = ""           # X-Trigger-Key required from LAN / browser callers when set
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "Settings":
         pb = cfg.get("playback") or {}
         cache = cfg.get("cache") or {}
+        lan = cfg.get("lan_api") or {}
 
         def flag(v, default):
             if isinstance(v, bool):
@@ -135,6 +138,8 @@ class Settings:
             music_wave=flag(pb.get("music_wave"), True),
             connection_mode=str(cfg.get("connection_mode") or "").lower(),
             edge_url=str(cfg.get("edge_url") or "").strip().rstrip("/"),
+            lan_triggers=flag(lan.get("enabled"), False),
+            trigger_key=str(lan.get("trigger_key") or ""),
         )
 
 

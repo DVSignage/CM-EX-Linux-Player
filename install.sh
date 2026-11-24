@@ -603,10 +603,12 @@ step "Configuring firewall"
 if command -v ufw &>/dev/null; then
     if ufw status | grep -q "Status: active"; then
         ufw allow 8081/tcp &>/dev/null && ok "ufw: opened port 8081 (player API)"
+        ufw allow 8083/tcp &>/dev/null && ok "ufw: opened port 8083 (control API, LAN triggers when enabled)"
     else
         # ufw is inactive — enable it and open required ports
         ufw allow ssh &>/dev/null        # keep SSH open!
         ufw allow 8081/tcp &>/dev/null
+        ufw allow 8083/tcp &>/dev/null
         ufw --force enable &>/dev/null
         ok "ufw: enabled and opened port 8081 (player API)"
     fi
