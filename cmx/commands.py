@@ -21,6 +21,7 @@ from typing import Optional, Tuple
 ENVELOPE_COMMANDS = {
     "play", "pause", "stop", "replay", "restart", "next", "previous", "seek",
     "refresh", "restart_service", "set_volume", "delete_player",
+    "trigger", "set_scene", "wall_play", "alignment", "template_patch",
 }
 
 # State commands: re-sent on every beat, deduplicated by their own keys.
@@ -28,7 +29,7 @@ ENVELOPE_COMMANDS = {
 STATE_COMMANDS = {
     "load_playlist", "load_content", "load_wall_content", "load_wall_rtp",
     "stop_wall", "show_ndi", "hide_ndi", "show_ndi_wall",
-    "start_ndi_broadcast", "stop_ndi_broadcast",
+    "start_ndi_broadcast", "stop_ndi_broadcast", "show_capture", "hide_capture",
 }
 
 COALESCED = {"next", "previous"}

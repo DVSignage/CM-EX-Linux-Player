@@ -1,10 +1,11 @@
 """
-The player orchestrator: enrollment, heartbeat, SSE push, command handling,
-playlist download/apply, refresh and re-enrollment.
+The player orchestrator: setup, enrollment, heartbeat, SSE push, command
+handling, playlist download/apply, templates, interactive walls, live
+capture, telemetry, refresh and re-enrollment.
 
-Behaviour mirrors DVSI Plus `Cmx/CmxPlayerService.cs` (cloud mode) — see
-README.md "How it works" for the summary, and the module docstrings of
-cms_client, commands, cache, playback and telemetry for the detailed rules.
+Behaviour mirrors DVSI Plus `Cmx/CmxPlayerService.cs` and the parts of
+`CmxPlayerWindow` that are decisions rather than drawing — see README.md
+"How it works" and the module docstrings for the detailed rules.
 """
 
 import asyncio
@@ -15,31 +16,38 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from urllib.parse import urlsplit
 
 import httpx
 
 from . import VERSION
 from . import faults as F
-from . import screens
-from .browser import Browser
+from . import inventory as inv
+from .browser import Browser, find_chromium
 from .cache import CacheStore, PendingDownloads, repair_name
 from .cms_client import CmsClient, CmsError, ContentGone, ContentNotReady, RateLimited
-from .commands import (ENVELOPE_COMMANDS, RESEND, RUNNING, STATE_COMMANDS, CommandGate,
-                       Coalescer, not_supported, parse_seek, parse_volume, try_read_bool)
+from .commands import (ENVELOPE_COMMANDS, RESEND, RUNNING, STATE_COMMANDS, CommandGate, Coalescer,
+                       not_supported, parse_seek, parse_volume, try_read_bool, try_read_int)
 from .config import Paths, Settings, load_state, save_state, write_json_atomic
+from .edge import CONTROL, EdgeRouter
 from .enrollment import CODE_POLL_CAP, NEW_CODE_RETRY, POLL_INTERVAL, enroll_link, poll_wait
-from .health import lan_address_for, metrics
-from .items import TEMPLATE, VIDEO, Item, classify
+from .health import address_signature, lan_address_for, metrics
+from .interaction import InteractionEngine, resolve_zone, wall_command_refusal
+from .items import TEMPLATE, WEB, Item, classify
+from .kiosk import Kiosk
 from .local_api import PORT as LOCAL_API_PORT, LocalApiServer
-from .playback import MpvPlayer, PlaylistEngine
+from .playback import PAUSED, PLAYING, STOPPED, PlaylistEngine
 from .preview import PreviewPusher, encode_jpeg
-from .telemetry import (TelemetryQueue, boot_event, crash_event, pending_crash_markers)
-from .wall import (STREAM_TUNING, crop_filter_normalised, crop_filter_pixel, normalise_crop,
-                   stream_url_with_buffers)
+from .surface import MpvSurface, PageSurface
+from .telemetry import (CLOUD_TYPES, TelemetryQueue, boot_event, crash_event, edge_event,
+                        pending_crash_markers, ts)
+from .templates import TemplateBuilder, patch_definition
+from .wall import STREAM_TUNING, crop_filter_normalised, crop_filter_pixel, normalise_crop, stream_url_with_buffers
+from .wallhost import WallHost
 
 try:
     from ndi import engine as ndi_engine
@@ -55,11 +63,18 @@ PROBE_TIMEOUT = 5.0
 SSE_RECONNECT = 3.0
 PENDING_INTERVAL = 15.0
 TELEMETRY_INTERVAL = 60.0
+HEALTH_INTERVAL = 60.0
 INFO_INTERVAL = 30.0
+NET_WATCH_INTERVAL = 2.0
+RSS_ONLINE, RSS_OFFLINE = 60.0, 900.0
+EDGE_PROBE_INTERVAL = 30.0
+STALE_404_HOLD = 120.0
 EMPTY_REFETCH_THROTTLE = 3.0
 OFFLINE_NOTICE_SECONDS = 6.0
 COMMAND_LOG_SUMMARY = 30.0
 PLAYLIST_FETCH_FAULT_AFTER = 3
+PROOF_MIN_SECONDS = 0.25
+WEB_PROBE_TTL = 600.0
 
 
 def _ndi_available() -> bool:
@@ -77,33 +92,59 @@ def _host_port(url: Optional[str]) -> Optional[str]:
         return None
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class Player:
     def __init__(self, settings: Settings, paths: Paths, *,
                  transport: Optional[httpx.AsyncBaseTransport] = None,
-                 mpv=None, browser=None, enable_local_api: bool = True):
+                 mpv=None, browser=None, surface=None,
+                 enable_local_api: bool = True, enable_kiosk: bool = True):
         self.settings = settings
         self.paths = paths
         paths.ensure()
         self.state: dict = load_state(paths)
-        self._adopt_cms_url(settings.cms_url)
+        self._adopt_config_url()
+        self._transport = transport
 
-        self.cms = CmsClient(settings.cms_url, lambda: self.state.get("player_secret"), transport)
-        self.mpv = mpv if mpv is not None else MpvPlayer(settings.display, settings.audio_output)
-        self.browser = browser if browser is not None else Browser(settings.display, paths.browser_profile)
         self.cache = CacheStore(paths.cache_dir, paths.cache_history, settings.keep_playlists)
         self.pending = PendingDownloads()
         self.faults = F.PlayerFaults()
         self.gate = CommandGate()
         self.coalescer = Coalescer()
         self.telemetry = TelemetryQueue(paths.telemetry_queue)
+        self._build_cms()
+
+        # Display: the renderer page in a Chromium kiosk, or mpv alone.
+        self.renderer = None
+        self.kiosk: Optional[Kiosk] = None
+        self.mpv = mpv
+        self._wall_mpv = None
+        if surface is not None:
+            self.surface = surface
+        elif mpv is None and browser is None and settings.renderer != "mpv" and find_chromium():
+            from .renderer.server import RendererServer
+            self.renderer = RendererServer(paths.cache_dir, paths.screens_dir, paths.rss_dir, self._page_event_threadsafe)
+            self.surface = PageSurface(self.renderer, web_probe=self._web_probe)
+            self.surface.window = Browser(settings.display, paths.browser_profile)
+            if enable_kiosk:
+                self.kiosk = Kiosk(settings.display, paths.kiosk_profile, self.renderer.url, self._renderer_recovered)
+        else:
+            if self.mpv is None:
+                from .playback import MpvPlayer
+                self.mpv = MpvPlayer(settings.display, settings.audio_output)
+            self.surface = MpvSurface(self.mpv, browser or Browser(settings.display, paths.browser_profile),
+                                      screens_dir=paths.screens_dir, crop_filter=crop_filter_normalised)
+        self.page_mode = isinstance(self.surface, PageSurface)
+
         self.engine = PlaylistEngine(
-            self.mpv, self.browser,
+            self.surface,
             default_image=settings.default_image_duration,
             resolve=self._resolve,
-            blank=self._show_black,
             on_waiting=self._show_waiting,
-            screen_size=self.mpv.display_size,
-            crop_filter=crop_filter_normalised,
+            on_item=self._on_item,
+            screen_size=self._screen_size,
         )
         self.preview = PreviewPusher(self._capture_frame, self._post_frame)
         self._enable_local_api = enable_local_api
@@ -116,10 +157,12 @@ class Player:
         self.last_playlist_hash: Optional[str] = None
         self.last_content_id: Optional[str] = None
         self._content_hash: Optional[str] = None
+        self._playlist_uuid: Optional[str] = None
         self._last_sent_key: Optional[str] = None
         self._last_empty_fetch = 0.0
         self._wall_key: Optional[str] = None
         self._ndi_active_key: Optional[str] = None
+        self._live_key: Optional[str] = None
         self._last_blank: Optional[bool] = None
         self._brightness_logged = False
         self._refreshing = False
@@ -131,87 +174,114 @@ class Player:
         self._cmd_log_key: Optional[str] = None
         self._cmd_log_repeats = 0
         self._cmd_log_since = 0.0
+        self._rss_feeds: Set[str] = set()
+        self._web_probe_cache: Dict[str, tuple] = {}
+        self.capture_devices: List[dict] = []
+
+        # Walls and proof of play
+        self.wall: Optional[InteractionEngine] = None
+        self.wall_host: Optional[WallHost] = None
+        self._wall_item: Optional[Item] = None
+        self._play_started: Optional[tuple] = None   # (utc datetime, monotonic)
 
         # Lifecycle
         self.online: Optional[bool] = None
         self.exit_code = 0
         self._stop = asyncio.Event()
         self._wake = asyncio.Event()
+        self._rss_wake = asyncio.Event()
         self._telemetry_kick = asyncio.Event()
         self._routines: Dict[str, asyncio.Task] = {}
         self._enroll_task: Optional[asyncio.Task] = None
         self._wall_task: Optional[asyncio.Task] = None
-        self._offline_notice: Optional[asyncio.TimerHandle] = None
+        self._overlay_timer: Optional[asyncio.TimerHandle] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._boot_reported = False
-        self.started_at = datetime.now(timezone.utc)
+        self.started_at = _utc_now()
         self._started_wall = time.time()
         self.local_ip: Optional[str] = None
         self.ndi_sources: List[dict] = []
         self._ndi_receiver = ndi_engine.NDIReceiver() if ndi_engine else None
         self._ndi_sender = ndi_engine.NDISender() if ndi_engine else None
+        self.inventory = inv.InventoryReporter(paths.inventory_state)
 
     # ------------------------------------------------------------------
-    # Identity
+    # Identity, connection
     # ------------------------------------------------------------------
 
     @property
     def player_id(self) -> Optional[str]:
         return self.state.get("player_id")
 
-    def _adopt_cms_url(self, url: str) -> None:
-        """A different CMS host means a different registration."""
+    @property
+    def cms_url(self) -> str:
+        return self.settings.cms_url or str(self.state.get("cms_url") or "")
+
+    @property
+    def connection_mode(self) -> str:
+        m = self.settings.connection_mode or str(self.state.get("connection_mode") or "cloud")
+        return m if m in ("cloud", "edge") else "cloud"
+
+    @property
+    def edge_url(self) -> str:
+        return self.settings.edge_url or str(self.state.get("edge_url") or "")
+
+    @property
+    def edge_mode(self) -> bool:
+        return self.cms.router.enabled
+
+    def _adopt_config_url(self) -> None:
+        """A config.yaml cms_url on a different host means a new registration."""
+        url = self.settings.cms_url
         if not url:
             return
         saved = self.state.get("cms_url")
-        if saved and _host_port(saved) != _host_port(url) and self.player_id:
+        if saved and _host_port(saved) != _host_port(url) and self.state.get("player_id"):
             log.warning(f"CMS changed ({saved} → {url}) — this screen will register again")
             for k in ("player_id", "player_secret", "site_id", "site_name"):
                 self.state.pop(k, None)
         self.state["cms_url"] = url
         save_state(self.paths, self.state)
 
+    def _build_cms(self) -> None:
+        router = EdgeRouter(self.connection_mode, self.edge_url, self.cms_url, self._edge_transition)
+        self.cms = CmsClient(self.cms_url, lambda: self.state.get("player_secret"), self._transport, router)
+        # Cloud mode sends only edge_event and inventory; proof-of-play and
+        # player_health are the edge's (held, never dropped, otherwise).
+        self.telemetry.routable = ({"edge_event", "inventory", "proof_of_play", "player_health"}
+                                   if router.enabled else set(CLOUD_TYPES))
+
     def _save(self) -> None:
         save_state(self.paths, self.state)
 
-    # ------------------------------------------------------------------
-    # Screens
-    # ------------------------------------------------------------------
+    def _screen_size(self) -> tuple:
+        if self.mpv is not None and hasattr(self.mpv, "display_size"):
+            return self.mpv.display_size()
+        return (1920, 1080)
 
-    def _screen(self, name: str, render) -> None:
-        path = self.paths.screens_dir / f"{name}.png"
-        try:
-            ok = render(path)
-        except Exception as e:
-            log.warning(f"[SCREEN] {name} failed: {e}")
-            ok = False
-        if ok:
-            self.mpv.clear_osd()
-            self.mpv.show_still(str(path))
-
-    def _show_black(self) -> None:
-        self._screen("black", screens.render_black)
+    # ------------------------------------------------------------------
+    # Screens and notices
+    # ------------------------------------------------------------------
 
     def _show_message(self, name: str, title: str, body: str = "") -> None:
-        if screens.available():
-            self._screen(name, lambda p: screens.render_message(p, self.mpv.display_size(), title, body))
-        else:
-            self._show_black()
-            self.mpv.show_osd(f"{title}\n\n{body}".strip(), 3_600_000)
+        self.surface.show_screen("message", title=title, body=body)
 
     def _show_waiting(self) -> None:
         self._show_message("waiting", "CMX Player — waiting for content…")
 
     def _show_enrollment(self, code: str) -> None:
-        link = enroll_link(self.settings.cms_url, code, self.state.get("site_id"))
-        server = self.settings.cms_url
-        site = self.state.get("site_name")
-        if screens.available():
-            self._screen("enrollment", lambda p: screens.render_enrollment(
-                p, self.mpv.display_size(), code, server, site, link))
-        else:
-            self._show_black()
-            self.mpv.show_osd(f"REGISTRATION CODE\n\n  {code}  \n\n"
-                              "Enter this code in CM:EX to approve this player.", 3_600_000)
+        server = self.cms_url if not self.edge_mode else f"{self.edge_url} (cloud: {self.cms_url} failover)"
+        self.surface.show_screen("enrollment", code=code, server=server, site=self.state.get("site_name"),
+                                 link=enroll_link(self.cms_url, code, self.state.get("site_id")))
+
+    def _overlay(self, kind: Optional[str], title: str = "", body: str = "", opaque: bool = True,
+                 hide_after: Optional[float] = None) -> None:
+        if self._overlay_timer:
+            self._overlay_timer.cancel()
+            self._overlay_timer = None
+        self.surface.overlay(kind, title, body, opaque)
+        if kind and hide_after and self._loop:
+            self._overlay_timer = self._loop.call_later(hide_after, lambda: self.surface.overlay(None))
 
     # ------------------------------------------------------------------
     # Run / shutdown
@@ -221,7 +291,7 @@ class Player:
         self._stop.set()
 
     async def run(self) -> int:
-        loop = asyncio.get_running_loop()
+        self._loop = loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, self.request_stop)
@@ -238,16 +308,22 @@ class Player:
             why = self.local_api.start()
             self.faults.put(F.PORT, F.port_message(LOCAL_API_PORT, why) if why else None)
 
-        if hasattr(self.mpv, "initialise"):
+        if self.renderer is not None:
+            why = self.renderer.start()
+            if why:
+                self.faults.set(F.PORT, F.port_message(self.renderer.port, why))
+            self.surface.send({"type": "config", "loading_indicator": self.settings.loading_indicator,
+                               "music_wave": self.settings.music_wave})
+            if self.kiosk is not None:
+                self.kiosk.start()
+        elif self.mpv is not None and hasattr(self.mpv, "initialise"):
             self.mpv.initialise(loop)
-        self.mpv.set_eof_callback(self.engine.on_eof)
-        self.mpv.set_volume(self.volume, self.muted)
-        self.mpv.clear_osd()
+        self.surface.set_volume(self.volume, self.muted)
+        self.surface.clear_osd()
 
-        if not self.settings.cms_url:
-            log.error("cms_url is not set in config.yaml.  Please set cms_url and restart.")
-            self._show_message("no-cms", "cms_url is not configured",
-                               "Set cms_url in config.yaml and restart the player.")
+        if not self.cms_url:
+            log.warning("No CMS address yet — showing the setup screen.")
+            self.surface.show_screen("setup", mode=self.connection_mode, cloud="", edge=self.edge_url)
         elif self.player_id:
             log.info(f"Resuming with player_id={self.player_id}")
             await self.startup()
@@ -269,6 +345,10 @@ class Player:
             await self.engine.release()
         except Exception:
             pass
+        if self.kiosk is not None:
+            await self.kiosk.stop()
+        if self.renderer is not None:
+            self.renderer.stop()
         if self._ndi_receiver:
             self._ndi_receiver.stop()
         if self._ndi_sender:
@@ -278,9 +358,34 @@ class Player:
         if self.local_api:
             self.local_api.stop()
         self.telemetry.save()
-        if hasattr(self.mpv, "terminate"):
-            self.mpv.terminate()
+        for m in (self.mpv, self._wall_mpv):
+            if m is not None and hasattr(m, "terminate"):
+                m.terminate()
         await self.cms.aclose()
+
+    # ------------------------------------------------------------------
+    # Setup screen
+    # ------------------------------------------------------------------
+
+    async def _on_setup(self, msg: dict) -> None:
+        mode = msg.get("mode") if msg.get("mode") in ("cloud", "edge") else "cloud"
+        cloud = str(msg.get("cms_url") or "").strip().rstrip("/")
+        edge = str(msg.get("edge_url") or "").strip().rstrip("/")
+        if not cloud.startswith(("http://", "https://")) or (mode == "edge" and not edge.startswith(("http://", "https://"))):
+            self.surface.show_screen("setup", mode=mode, cloud=cloud, edge=edge, error="Enter a valid server address.")
+            return
+        if self.player_id and _host_port(self.state.get("cms_url")) != _host_port(cloud):
+            for k in ("player_id", "player_secret", "site_id", "site_name"):
+                self.state.pop(k, None)
+        self.state.update(cms_url=cloud, connection_mode=mode, edge_url=edge if mode == "edge" else "")
+        self._save()
+        await self.cms.aclose()
+        self._build_cms()
+        log.info(f"[SETUP] {mode} connection: cloud={cloud}{' edge=' + edge if mode == 'edge' else ''}")
+        if self.player_id:
+            await self.startup()
+        elif self._enroll_task is None or self._enroll_task.done():
+            self._enroll_task = asyncio.ensure_future(self.enroll())
 
     # ------------------------------------------------------------------
     # Startup
@@ -298,25 +403,60 @@ class Player:
             await self.re_enroll()
             return
         self.start_routines()
+        if self.edge_mode:
+            asyncio.ensure_future(self._check_site())
         if status == "registered":
             self._set_online(True, fetch=False)
             self.spawn_fetch()
         else:
             self._set_online(False)
 
-    async def _probe(self) -> str:
-        body = {"status": "online", "timestamp": datetime.now(timezone.utc).isoformat(),
+    def _probe_body(self) -> dict:
+        return {"status": "online", "timestamp": _utc_now().isoformat(),
                 "capture_devices": [], "decklink_devices": [], "decklink_supported": False,
                 "ndi_sources": [], "ndi_supported": False}
+
+    async def _probe(self) -> str:
         try:
-            r = await asyncio.wait_for(self.cms.heartbeat(self.player_id, body, timeout=PROBE_TIMEOUT),
+            r = await asyncio.wait_for(self.cms.heartbeat(self.player_id, self._probe_body(), timeout=PROBE_TIMEOUT),
                                        PROBE_TIMEOUT + 1)
         except Exception as e:
             log.info(f"[STARTUP] CMS unreachable ({type(e).__name__}) — playing offline")
             return "offline"
         if r.status_code == 404:
+            if self.cms.last_from_edge:
+                verdict = await self._confirm_deleted()
+                return {"deleted": "unregistered", "alive": "registered"}.get(verdict, "offline")
             return "unregistered"
         return "registered" if 200 <= r.status_code < 300 else "offline"
+
+    async def _confirm_deleted(self) -> str:
+        """An edge 404 may be a fresh replica that has not synced this player
+        yet: ask the cloud directly before wiping anything."""
+        try:
+            r = await self.cms.heartbeat_cloud(self.player_id, self._probe_body())
+        except Exception:
+            return "inconclusive"
+        if r.status_code == 404:
+            return "deleted"
+        if 200 <= r.status_code < 300:
+            self.cms.router.force_failover(CONTROL, STALE_404_HOLD, "the edge does not know this player yet")
+            self._emit_edge_event("warn", "edge_stale_404", "edge answered 404 for a player the cloud knows",
+                                  {"hold_s": STALE_404_HOLD})
+            return "alive"
+        return "inconclusive"
+
+    async def _check_site(self) -> None:
+        info = await self.cms.site_info()
+        if info is None:
+            log.warning("[EDGE] the edge server did not describe its site (GET /api/v1/site)")
+            return
+        mine = self.state.get("site_id")
+        log.info(f"[EDGE] edge serves site {info.get('site_id')} (enrolled={info.get('enrolled')})")
+        if mine and info.get("site_id") and info.get("site_id") != mine:
+            log.warning(f"[EDGE] this player belongs to site {mine} but the edge serves {info.get('site_id')}")
+        if info.get("enrolled") is False:
+            log.warning("[EDGE] the edge server is not enrolled with the cloud")
 
     def start_routines(self) -> None:
         for t in self._routines.values():
@@ -328,7 +468,14 @@ class Player:
             "pending": asyncio.ensure_future(self._pending_loop()),
             "telemetry": asyncio.ensure_future(self._telemetry_loop()),
             "info": asyncio.ensure_future(self._info_loop()),
+            "net": asyncio.ensure_future(self._net_watch_loop()),
+            "rss": asyncio.ensure_future(self._rss_loop()),
+            "wall": asyncio.ensure_future(self._wall_tick_loop()),
+            "inventory": asyncio.ensure_future(self._inventory_loop()),
         }
+        if self.edge_mode:
+            self._routines["health"] = asyncio.ensure_future(self._health_loop())
+            self._routines["edge_probe"] = asyncio.ensure_future(self._edge_probe_loop())
         self._queue_stability_events()
 
     # ------------------------------------------------------------------
@@ -348,6 +495,8 @@ class Player:
                 await asyncio.sleep(NEW_CODE_RETRY)
                 continue
             self._capture_site(data)
+            if self.edge_mode and not data.get("site_id"):
+                log.warning("[EDGE] the code came back without a site: this player will replicate to no edge")
             log.info(f"Enrollment code: {code}")
             self._show_enrollment(code)
             if await self._poll_code(code):
@@ -384,7 +533,6 @@ class Player:
                 wait = pending
             else:
                 log.warning(f"Enrollment poll answered HTTP {status} — keeping code {code}")
-
         return False
 
     def _capture_site(self, data: dict) -> None:
@@ -399,7 +547,7 @@ class Player:
             self.state["player_secret"] = body["player_secret"]
         self._capture_site(body)
         self._save()
-        self.mpv.clear_osd()
+        self.surface.clear_osd()
         self._show_waiting()
         self.start_routines()
         self._set_online(True, fetch=False)
@@ -427,7 +575,7 @@ class Player:
         self.pending = PendingDownloads()
         self._gone.clear()
         self.last_playlist_hash = self.last_content_id = self._last_sent_key = None
-        self._wall_key = self._ndi_active_key = None
+        self._wall_key = self._ndi_active_key = self._live_key = None
         self.online = None
         if self._enroll_task is None or self._enroll_task.done():
             self._enroll_task = asyncio.ensure_future(self.enroll())
@@ -466,6 +614,13 @@ class Player:
             self._set_online(False)
             return
         if r.status_code == 404:
+            if self.cms.last_from_edge:
+                verdict = await self._confirm_deleted()
+                if verdict == "deleted":
+                    await self.re_enroll()
+                elif verdict == "inconclusive":
+                    self._set_online(False)
+                return
             await self.re_enroll()
             return
         if r.status_code == 409:
@@ -486,26 +641,27 @@ class Player:
 
     def heartbeat_body(self) -> dict:
         st = self.engine.status()
-        if self._wall_task and not self._wall_task.done():
+        live = (self._wall_task and not self._wall_task.done()) or self._live_key or self._ndi_active_key
+        if live:
             st.update(status="playing", playback_status="playing", position=None, duration=None)
         body = {
             "status": st["status"],
             "playback_status": st["playback_status"],
             "position": st["position"],
             "duration": st["duration"],
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": _utc_now().isoformat(),
             "current_content_id": st["current_content_id"],
             "current_content_name": st["current_content_name"],
             "playlist_index": st["playlist_index"],
             "playlist_total": st["playlist_total"],
-            "scene_id": None,
-            "home_scene_id": None,
+            "scene_id": self.wall.active_scene_id if self.wall else None,
+            "home_scene_id": self.wall.current_home if self.wall else None,
             "local_ip": self.local_ip,
             "api_port": LOCAL_API_PORT,
             "player_version": VERSION,
             "uptime_seconds": int(time.time() - self._started_wall),
             "error": self.compute_error(),
-            "capture_devices": [],
+            "capture_devices": list(self.capture_devices),
             "decklink_devices": [],
             "decklink_supported": False,
             "decklink_reason": "DeckLink capture is not supported by the Linux player",
@@ -543,10 +699,13 @@ class Player:
         else:
             self.faults.clear(F.NOTHING_PLAYS)
             self.faults.clear(F.ITEMS_FAIL)
-        cur = self.engine.current
-        err = getattr(self.browser, "last_error", None)
-        self.faults.put(F.RENDERER, F.renderer_message(err)
-                        if err and cur is not None and cur.kind not in (VIDEO, "image") else None)
+        if self.kiosk is not None and self.kiosk.failing:
+            self.faults.set(F.RENDERER, F.renderer_message(
+                f"{self.kiosk.recoveries_in_window} recoveries in 5 min"))
+        elif self.kiosk is not None and self.kiosk.last_error:
+            self.faults.set(F.RENDERER, F.renderer_message(self.kiosk.last_error))
+        else:
+            self.faults.clear(F.RENDERER)
         return self.faults.top()
 
     def _set_online(self, online: bool, fetch: bool = True) -> None:
@@ -556,26 +715,20 @@ class Player:
                 log.info("CMS reachable again")
                 if fetch:
                     self.spawn_fetch()
-            self._cancel_offline_notice()
-            self.mpv.clear_osd()
-            if not self.engine.has_content and not (self._wall_task and not self._wall_task.done()):
+                self._rss_wake.set()
+            self._overlay(None)
+            if not self.engine.has_content and not (self._wall_task and not self._wall_task.done()) \
+                    and not self._live_key:
                 self._show_waiting()
         elif not online and prev is not False:
             log.warning("CMS unreachable — offline")
             if self.engine.has_content:
-                self.mpv.show_osd("Server offline\nPlaying your saved content — it will update "
-                                  "when the server is back online.", int(OFFLINE_NOTICE_SECONDS * 1000))
-                self._cancel_offline_notice()
-                self._offline_notice = asyncio.get_running_loop().call_later(
-                    OFFLINE_NOTICE_SECONDS, self.mpv.clear_osd)
+                self._overlay("offline", "Server offline",
+                              "No problem — playing your saved content. It'll update automatically when the server is back online.",
+                              opaque=False, hide_after=OFFLINE_NOTICE_SECONDS)
             else:
                 self._show_message("offline", "Server offline",
                                    "Trying to reconnect… content will start once the server is back online.")
-
-    def _cancel_offline_notice(self) -> None:
-        if self._offline_notice:
-            self._offline_notice.cancel()
-            self._offline_notice = None
 
     # ------------------------------------------------------------------
     # Responses and commands
@@ -673,10 +826,12 @@ class Player:
             await e.stop()
             return True, "stopped", None
         if cmd in ("replay", "restart"):
-            if e.mode == "stopped" and e.items:
+            if e.mode == STOPPED and e.items:
                 await e.play()
                 return True, "replaying", None
             ok, msg = await e.replay()
+            if ok and self.wall is not None:
+                self.wall.reset()
             return ok, msg, None
         if cmd in ("next", "previous"):
             if not e.items:
@@ -699,11 +854,17 @@ class Player:
             return True, f"volume {vol}{' (muted)' if muted else ''}", None
         if cmd == "delete_player":
             return True, "re-enrolling", self.re_enroll
+        if cmd in ("trigger", "set_scene", "wall_play", "alignment"):
+            ok, msg = self._wall_command(cmd, args)
+            return ok, msg, None
+        if cmd == "template_patch":
+            ok, msg = await self._template_patch(args)
+            return ok, msg, None
         return False, not_supported(cmd), None
 
     def _apply_volume(self, volume: int, muted: bool) -> None:
         self.volume, self.muted = volume, muted
-        self.mpv.set_volume(volume, muted)
+        self.surface.set_volume(volume, muted)
         self.state["volume"], self.state["muted"] = volume, muted
         self._save()
         log.info(f"Volume {volume}{' (muted)' if muted else ''}")
@@ -736,11 +897,116 @@ class Player:
             log.info(f"desired_brightness={data['desired_brightness']} (no backlight control on this player)")
             self._brightness_logged = True
 
+    # -- walls --------------------------------------------------------------
+
+    def _template_on_screen(self) -> Optional[Item]:
+        cur = self.engine.current
+        if cur is not None and cur.kind == TEMPLATE and self.engine.mode in (PLAYING, PAUSED):
+            return cur
+        return None
+
+    def _wall_command(self, cmd: str, args: dict):
+        tpl = self._template_on_screen()
+        refusal = wall_command_refusal(args, tpl.template_id if tpl else None)
+        if refusal:
+            return False, refusal
+        if self.wall is None:
+            return False, "no interactive template on screen"
+        if cmd == "trigger":
+            tid = try_read_int(args.get("id") if args.get("id") is not None else args.get("trigger_id"))
+            if tid is None:
+                return False, "trigger needs a numeric 'id'"
+            return self.wall.trigger(tid, "cms")
+        if cmd == "set_scene":
+            target = args.get("scene_id") or args.get("scene")
+            if not target:
+                return False, "set_scene needs 'scene_id'"
+            return self.wall.set_scene(str(target), "cms", bool(try_read_bool(args.get("stop"))))
+        if cmd == "wall_play":
+            return self.wall.play_content(args.get("content_id") or args.get("contentId"), "cms")
+        return self.wall.set_alignment(bool(try_read_bool(args.get("enabled"))))
+
+    def _attach_wall(self, item: Optional[Item]) -> None:
+        if item is self._wall_item:
+            return
+        self.wall = self.wall_host = None
+        self._wall_item = None
+        if item is None or item.kind != TEMPLATE or not self.page_mode:
+            return
+        built = item.extra.get("built")
+        if not built or built.get("model") is None:
+            return
+        host = WallHost(self.surface.send, built["zones"], built["media"],
+                        paused=lambda: self.engine.mode == PAUSED)
+        engine = InteractionEngine(
+            built["model"], built["media"], host, _utc_now,
+            zone=resolve_zone(built["payload"].get("timezone"), log.info),
+            emit=lambda level, code, message, detail: self._emit_edge_event(level, code, message, detail),
+            log=log.info)
+        host.engine = engine
+        self.wall, self.wall_host, self._wall_item = engine, host, item
+        engine.start()
+        log.info(f"[WALL] interactive template {item.template_id}: scene '{engine.active_scene_id}'")
+
+    async def _wall_tick_loop(self) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(0.5)
+            if self.wall is not None:
+                try:
+                    self.wall.tick()
+                except Exception as e:
+                    log.debug(f"[WALL] tick failed: {e}")
+
+    # -- template_patch -------------------------------------------------------
+
+    async def _template_patch(self, args: dict):
+        item = self._template_on_screen()
+        if item is None:
+            return False, "no template on screen"
+        tid = args.get("template_id")
+        if isinstance(tid, str) and tid and item.template_id and tid != item.template_id:
+            return False, f"template {tid} is not on screen"
+        eid = args.get("element_id")
+        if not eid:
+            return False, "template_patch needs 'element_id'"
+        definition = item.extra.get("definition")
+        if definition is None:
+            # shown through the CMS render page: the page reloads with the change
+            await self.surface.show_page(item, force=True)
+            return True, f"patched {eid} (page reloaded)"
+        ok, msg, new_def = patch_definition(definition, args)
+        if not ok:
+            return False, msg
+        cid = args.get("content_id")
+        kind = str(args.get("kind") or args.get("type") or "")
+        if cid and kind in ("image", "video"):
+            path = await self._ensure_media(str(cid), kind, network=True)
+            if path is None:
+                return False, f"content {cid} could not be fetched"
+        built = await TemplateBuilder(self._nested_def_fetcher(True),
+                                      lambda c, r: self._ensure_media(c, r, network=True)).build(item.template_id, new_def)
+        if built is None:
+            return False, f"kind {kind} not patchable"
+        element = next((e for e in built["payload"]["elements"] if e.get("id") == eid), None)
+        try:
+            write_json_atomic(self.paths.cache_dir / f"template_{item.template_id}.json", new_def)
+        except OSError:
+            pass
+        item.extra.update(definition=new_def, page=built["payload"], built=built,
+                          deps=list(built["media"].values()))
+        item.content_hash = built["hash"]
+        self._rss_feeds |= built["rss"]
+        self.surface.send({"type": "template_patch", "tid": item.template_id, "element": element,
+                           "media": built["payload"]["media"]})
+        return True, f"patched {eid}"
+
     # -- state commands ------------------------------------------------------
 
     async def _state_command(self, cmd: str, a: dict) -> None:
         if cmd == "load_playlist":
             incoming = a.get("playlist_hash") or a.get("playlist_id")
+            if a.get("playlist_id"):
+                self._playlist_uuid = str(a["playlist_id"])
             if incoming and incoming == self.last_playlist_hash:
                 if self.engine.has_content:
                     return
@@ -796,7 +1062,8 @@ class Player:
             crop = a.get("wall_crop")
             key = f"rtp_{url}_{json.dumps(crop, sort_keys=True)}"
             if key == self._ndi_active_key and self._wall_task and not self._wall_task.done():
-                if not self.mpv.core_idle:
+                mpv = self._stream_mpv(create=False)
+                if mpv is None or not mpv.core_idle:
                     return
                 log.info("[WALL STREAM] same stream but mpv idle — reopening")
             self._cancel_wall()
@@ -808,6 +1075,14 @@ class Player:
             self._leave_walls()
             await self.engine.resume()
 
+        elif cmd == "show_capture":
+            await self._show_capture(a)
+
+        elif cmd == "hide_capture":
+            if self._live_key:
+                self._live_key = None
+                await self.engine.resume()
+
         elif cmd == "show_ndi":
             name = a.get("source_name") or a.get("ndi_source_name")
             if name and self._ndi_receiver:
@@ -816,7 +1091,7 @@ class Player:
                     return
                 self._ndi_active_key = key
                 await self.engine.suspend()
-                self.mpv.stop()
+                await self.surface.stop()
                 await asyncio.to_thread(self._ndi_receiver.start, name)
 
         elif cmd == "hide_ndi":
@@ -834,7 +1109,7 @@ class Player:
                     return
                 self._ndi_active_key = key
                 await self.engine.suspend()
-                self.mpv.stop()
+                await self.surface.stop()
                 n = normalise_crop(crop)
                 ndi_crop = {"x": n[0], "y": n[1], "w": n[2], "h": n[3]} if n else None
                 await asyncio.to_thread(self._ndi_receiver.start, name, ndi_crop)
@@ -854,19 +1129,58 @@ class Player:
         except (TypeError, ValueError):
             return 0.0
 
+    async def _show_capture(self, a: dict) -> None:
+        kind = str(a.get("capture_kind") or "").lower()
+        label = a.get("capture_device_label")
+        device_id = a.get("capture_device_id")
+        audio = try_read_bool(a.get("audio_enabled"))
+        if audio is None:
+            audio = try_read_bool(a.get("emit_audio"))
+        decklink = kind in ("decklink", "blackmagic") or str(device_id or "").startswith("decklink:")
+        if audio is None:
+            audio = decklink        # DeckLink audio on, USB off (DVSI defaults)
+        key = f"capture:{device_id}:{label}:a{int(bool(audio))}"
+        if key == self._live_key:
+            return
+        if decklink:
+            log.warning("[CAPTURE] DeckLink capture is not supported on Linux — trying it as a USB device")
+        if not self.page_mode:
+            log.warning("[CAPTURE] live capture needs the renderer page (Chromium); not shown")
+            return
+        self._live_key = key
+        self._cancel_wall()
+        self._wall_key = self._ndi_active_key = None
+        await self.engine.suspend()
+        log.info(f"[CAPTURE] showing {label or device_id or 'the first camera'} (audio {'on' if audio else 'off'})")
+        self.surface.send({"type": "capture", "gen": self.surface.gen + 1, "device_label": label,
+                           "device_id": None if decklink else device_id, "audio": bool(audio)})
+
     def _cancel_wall(self) -> None:
         if self._wall_task and not self._wall_task.done():
             self._wall_task.cancel()
         self._wall_task = None
 
     def _leave_walls(self) -> None:
-        """A playlist or direct pick takes the screen back from any wall."""
+        """A playlist or direct pick takes the screen back from any wall or live input."""
         self._cancel_wall()
         self._wall_key = None
         self._ndi_active_key = None
+        self._live_key = None
         if self._ndi_receiver and self._ndi_receiver.active:
             self._ndi_receiver.stop()
         self.engine.set_crop(None)
+
+    def _stream_mpv(self, create: bool = True):
+        """mpv for the multicast wall: the main mpv in mpv mode, a dedicated
+        one (created on demand, closed after) in renderer-page mode."""
+        if not self.page_mode:
+            return self.mpv
+        if self._wall_mpv is None and create:
+            from .playback import MpvPlayer
+            self._wall_mpv = MpvPlayer(self.settings.display, self.settings.audio_output)
+            self._wall_mpv.initialise(asyncio.get_running_loop())
+            self._wall_mpv.set_volume(self.volume, self.muted)
+        return self._wall_mpv
 
     async def _play_wall_rtp(self, url: str, crop: Optional[dict]) -> None:
         """Server-streamed wall: open the multicast stream and crop this
@@ -875,25 +1189,74 @@ class Player:
         vf = crop_filter_pixel(crop)
         log.info(f"[WALL STREAM] Opening {url} vf={vf!r}")
         await self.engine.suspend()
-        self.mpv.stop()
+        try:
+            mpv = self._stream_mpv()
+        except Exception as e:
+            log.error(f"[WALL STREAM] mpv unavailable: {e}")
+            return
+        if not self.page_mode:
+            mpv.stop()
         try:
             await asyncio.sleep(0.3)
             for k, v in STREAM_TUNING.items():
-                self.mpv.set(k, v)
-            self.mpv.play_file(stream_url_with_buffers(url), vf=vf)
+                mpv.set(k, v)
+            mpv.play_file(stream_url_with_buffers(url), vf=vf)
             await asyncio.sleep(5)
             while True:
                 await asyncio.sleep(2)
-                if self.mpv.core_idle:
+                if mpv.core_idle:
                     log.warning("[WALL STREAM] Stream died — clearing key for auto-recovery")
                     self._ndi_active_key = None
                     return
         except asyncio.CancelledError:
             log.info("[WALL STREAM] stopped (switching content)")
         finally:
-            self.mpv.set("keep-open", "always")
-            self.mpv.set("cache", "auto")
-            self.mpv.set("profile", "default")
+            if self.page_mode and self._wall_mpv is not None:
+                self._wall_mpv.terminate()
+                self._wall_mpv = None
+            else:
+                mpv.set("keep-open", "always")
+                mpv.set("cache", "auto")
+                mpv.set("profile", "default")
+
+    # ------------------------------------------------------------------
+    # Page events (renderer → player)
+    # ------------------------------------------------------------------
+
+    def _page_event_threadsafe(self, msg: dict) -> None:
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._page_event, msg)
+
+    def _page_event(self, msg: dict) -> None:
+        t = msg.get("type")
+        if self.page_mode:
+            self.surface.on_page_event(msg)
+        if t == "alive" and self.kiosk is not None:
+            self.kiosk.alive()
+        elif t == "setup":
+            asyncio.ensure_future(self._on_setup(msg))
+        elif t == "tap" and self.wall is not None and self.wall.m.policy.touch:
+            tid = try_read_int(msg.get("trigger_id"))
+            if tid is not None:
+                ok, why = self.wall.trigger(tid, "touch")
+                log.info(f"[WALL] tap {tid}: {why}")
+        elif t == "zone_playing" and self.wall_host is not None:
+            self.wall_host.page_playing(str(msg.get("surface") or ""))
+        elif t == "zone_returned" and self.wall_host is not None:
+            self.wall_host.page_returned(str(msg.get("surface") or ""))
+        elif t == "devices":
+            devs = msg.get("capture") if isinstance(msg.get("capture"), list) else []
+            self.capture_devices = [{"label": d.get("label"), "deviceId": d.get("deviceId")}
+                                    for d in devs if isinstance(d, dict)]
+        elif t == "error":
+            log.warning(f"[RENDERER] {msg.get('what')}")
+
+    def _renderer_recovered(self, info: dict) -> None:
+        if not self.player_id:
+            return
+        reason = info.get("reason")
+        self._emit_edge_event("error", "renderer_crash", f"Chromium renderer {info.get('kind')} ({reason}), recovery: relaunch",
+                              {**info, "outcome": "relaunched"})
 
     # ------------------------------------------------------------------
     # Playlist fetch / apply
@@ -949,21 +1312,27 @@ class Player:
             pass
         return None
 
+    async def _content_meta(self, content_id: str) -> Optional[dict]:
+        """Content metadata, waiting out CM:EX's 429s within a small budget."""
+        spent = 0.0
+        for _attempt in range(4):
+            try:
+                return await self.cms.content_meta(content_id)
+            except RateLimited as e:
+                wait = min(5.0, max(1.0, e.retry_after or 1.0))
+                if spent + wait > 30:
+                    return None
+                spent += wait
+                await asyncio.sleep(wait)
+            except Exception as e:
+                log.warning(f"[CONTENT] metadata for {content_id} unavailable: {e}")
+                return None
+        return None
+
     async def load_single_content(self, content_id: str, duration: float = 0.0, force: bool = False) -> bool:
         """A content pushed directly (not in a playlist): fetch its full
         metadata so a template/URL/RSS is classified like a playlist item."""
-        meta = None
-        for attempt in range(4):
-            try:
-                meta = await self.cms.content_meta(content_id)
-                break
-            except RateLimited as e:
-                await asyncio.sleep(min(5.0, max(1.0, e.retry_after or 1.0)))
-            except Exception as e:
-                log.warning(f"[CONTENT] metadata for {content_id} unavailable: {e}")
-                break
-        if not meta:
-            meta = self._offline_record(content_id)
+        meta = await self._content_meta(content_id) or self._offline_record(content_id)
         if not meta:
             log.error(f"[CONTENT] {content_id}: no metadata and no offline record — leaving the screen as is")
             self.last_content_id = None
@@ -976,35 +1345,116 @@ class Player:
             return None
         return self.cache.find(item.content_id, item.path)
 
-    async def _template_canvas(self, item: Item, kept: set, network: bool) -> None:
-        """The template's design canvas, for scaling its render to the screen."""
-        if not item.template_id:
-            return
-        name = f"template_{item.template_id}.json"
-        kept.add(name)
-        path = self.paths.cache_dir / name
-        definition = None
+    # -- templates ------------------------------------------------------------
+
+    def _nested_def_fetcher(self, network: bool):
+        async def fetch(tid: str) -> Optional[dict]:
+            return await self._template_definition(tid, network)
+        return fetch
+
+    async def _template_definition(self, tid: str, network: bool) -> Optional[dict]:
+        path = self.paths.cache_dir / f"template_{tid}.json"
         if network and self.player_id:
-            definition = await self.cms.template_definition(self.player_id, item.template_id)
-            if definition:
+            d = await self.cms.template_definition(self.player_id, tid)
+            if d:
                 try:
-                    write_json_atomic(path, definition)
+                    write_json_atomic(path, d)
                 except OSError:
                     pass
-        if definition is None:
-            try:
-                definition = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                return
+                return d
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    async def _ensure_media(self, cid: str, role: str, network: bool) -> Optional[Path]:
+        """A template / wall media file, cached as {content_id}{ext}. Returns
+        the path even while its download is pending, so the template lists it
+        and shows it once the file lands."""
+        found = self.cache.find(cid, self.cache.dir / f"{cid}{'.png' if role == 'image' else '.mp4'}")
+        if found is not None:
+            return found
+        if not network:
+            return None
+        meta = await self._content_meta(cid)
+        filename = (meta or {}).get("filename") or ""
+        ext = Path(filename).suffix.lower() or (".png" if role == "image" else ".mp4")
+        dest = self.cache.dir / f"{cid}{ext}"
+        got = await self._download(cid, dest, filename or dest.name)
+        return got or dest
+
+    async def _prepare_template(self, item: Item, kept: set, network: bool) -> None:
+        if not item.template_id:
+            return
+        kept.add(f"template_{item.template_id}.json")
+        definition = await self._template_definition(item.template_id, network)
+        if not definition:
+            return
         try:
             item.canvas = (int(definition.get("width") or 1920), int(definition.get("height") or 1080))
-        except (TypeError, ValueError, AttributeError):
+        except (TypeError, ValueError):
             pass
+        if not self.surface.supports_native:
+            return
+        built = await TemplateBuilder(self._nested_def_fetcher(network),
+                                      lambda c, r: self._ensure_media(c, r, network)).build(item.template_id, definition)
+        if built is None:
+            return
+        item.extra.update(definition=definition, page=built["payload"], built=built,
+                          deps=list(built["media"].values()))
+        item.content_hash = built["hash"]
+        kept |= built["files"]
+        self._rss_feeds |= built["rss"]
+
+    # -- web pages ----------------------------------------------------------------
+
+    async def _fetch_snapshot(self, item: Item) -> None:
+        """The page's saved still, if the CMS has one (409 = live only)."""
+        dest = self.cache.dir / f"{item.content_id}.snapshot.png"
+        try:
+            await self.cms.download(item.content_id, dest)
+        except Exception:
+            pass
+
+    async def _web_probe(self, item: Item) -> dict:
+        """How to show a web item: in the page, in its own window (the site
+        refuses to be framed), or as its saved still (unreachable)."""
+        snap = self.cache.dir / f"{item.content_id}.snapshot.png"
+        extra = {}
+        if snap.exists():
+            when = datetime.fromtimestamp(snap.stat().st_mtime).strftime("%-d %b %H:%M") \
+                if sys.platform != "win32" else datetime.fromtimestamp(snap.stat().st_mtime).strftime("%d %b %H:%M")
+            extra.update(snapshot=f"/media/{snap.name}", badge=f"Saved page · {when}")
+        if self.online is False and snap.exists():
+            return {**extra, "snapshot_only": True}
+        url = item.url or ""
+        if url.startswith(self.cms_url):
+            return extra     # CM:EX's own pages frame fine
+        cached = self._web_probe_cache.get(url)
+        if cached and time.monotonic() - cached[0] < WEB_PROBE_TTL:
+            return {**extra, **cached[1]}
+        verdict = {}
+        try:
+            async with httpx.AsyncClient(timeout=6, follow_redirects=True) as c:
+                async with c.stream("GET", url) as r:
+                    xfo = (r.headers.get("x-frame-options") or "").lower()
+                    csp = (r.headers.get("content-security-policy") or "").lower()
+                    fa = next((d for d in csp.split(";") if d.strip().startswith("frame-ancestors")), "")
+                    if xfo in ("deny", "sameorigin") or (fa and "*" not in fa):
+                        verdict = {"window": True}
+        except Exception:
+            if snap.exists():
+                verdict = {"snapshot_only": True}
+        self._web_probe_cache[url] = (time.monotonic(), verdict)
+        return {**extra, **verdict}
+
+    # -- apply ----------------------------------------------------------------
 
     async def process_playlist(self, data: dict, force: bool = False, prune: bool = True,
                                network: bool = True) -> bool:
-        """Save the offline copy, classify, download what is missing (playing
-        as soon as the first item is ready), then retain/prune the cache."""
+        """Save the offline copy, classify, prepare templates, download what is
+        missing (playing as soon as the first item is ready), then
+        retain/prune the cache."""
         raw = data.get("items") or []
         if not raw:
             return False
@@ -1023,7 +1473,12 @@ class Player:
             if item is None:
                 continue
             if item.kind == TEMPLATE:
-                await self._template_canvas(item, kept, network)
+                await self._prepare_template(item, kept, network)
+            elif item.kind == WEB and network and "/rss/" not in (item.url or ""):
+                kept.add(f"{item.content_id}.snapshot.png")
+                asyncio.ensure_future(self._fetch_snapshot(item))
+            elif item.kind == WEB:
+                kept.add(f"{item.content_id}.snapshot.png")
             if item.is_media:
                 found = self.cache.find(item.content_id, item.path)
                 if found is not None:
@@ -1035,8 +1490,10 @@ class Player:
         if not final:
             return False
 
-        self.pending.keep_only({it.content_id for it in final if it.is_media})
-        key = "|".join(f"{it.path or it.url}:{it.duration:g}" for it in final)
+        self.pending.keep_only({it.content_id for it in final if it.is_media} |
+                               {p.content_id for p in self.pending.entries.values()
+                                if any(p.path in it.extra.get("deps", []) for it in final)})
+        key = "|".join(f"{it.path or it.url}:{it.duration:g}:{it.content_hash}" for it in final)
 
         if not network:
             to_download = []
@@ -1052,19 +1509,29 @@ class Player:
                 await self.engine.load(final)
             self._last_sent_key = key
         else:
-            log.info(f"Need to download {len(to_download)} file(s); playback starts once the first item is ready.")
+            total = len(to_download)
+            log.info(f"Need to download {total} file(s); playback starts once the first item is ready.")
             started = False
             if not force and self.engine.ready(final[0]):
                 await self.engine.load(final)
                 started = True
-            for i, item in enumerate(to_download, 1):
-                log.info(f"[DOWNLOADING {i}/{len(to_download)}] {item.name}")
-                ok = await self._download(item)
-                if ok and not started and self.engine.ready(final[0]):
+            for i, item in enumerate(to_download):
+                log.info(f"[DOWNLOADING {i + 1}/{total}] {item.name}")
+                self.surface.download_progress(i, total, 0.0)
+
+                def progress(done, size, i=i):
+                    if size:
+                        self.surface.download_progress(i, total, done / size)
+
+                got = await self._download(item.content_id, item.path, item.name, progress)
+                if got is not None:
+                    item.path = got
+                if got is not None and not started and self.engine.ready(final[0]):
                     await self.engine.load(final)
                     started = True
-                elif ok:
+                elif got is not None:
                     await self.engine.kick()
+            self.surface.download_progress(total, total, 1.0)
             await self.engine.load(final)
             self._last_sent_key = key
 
@@ -1074,30 +1541,30 @@ class Player:
             self.cache.enforce_lru(kept)
         return True
 
-    async def _download(self, item: Item) -> bool:
-        lock = self._dl_locks.setdefault(str(item.path), asyncio.Lock())
+    async def _download(self, cid: str, path: Path, name: str, progress=None) -> Optional[Path]:
+        lock = self._dl_locks.setdefault(str(path), asyncio.Lock())
         async with lock:
             try:
-                path = await self.cms.download(item.content_id, item.path)
+                got = await self.cms.download(cid, path, progress)
             except ContentNotReady as e:
-                log.info(f"[DOWNLOAD] {item.name} not ready yet (retry in {e.retry_after or 30:.0f}s)")
-                self.pending.not_ready(item.content_id, item.path, item.name, e.retry_after)
-                return False
+                log.info(f"[DOWNLOAD] {name} not ready yet (retry in {e.retry_after or 30:.0f}s)")
+                self.pending.not_ready(cid, path, name, e.retry_after)
+                return None
             except ContentGone as e:
-                log.error(f"[DOWNLOAD] {item.name} no longer exists ({e}) — not retrying")
-                self._gone.add(item.content_id)
-                self.pending.done(item.content_id)
-                return False
+                log.error(f"[DOWNLOAD] {name} no longer exists ({e}) — not retrying")
+                self._gone.add(cid)
+                self.pending.done(cid)
+                return None
             except (CmsError, httpx.HTTPError, OSError) as e:
-                log.error(f"[DOWNLOAD] {item.name} failed: {e}")
-                self.pending.failed(item.content_id, item.path, item.name)
+                log.error(f"[DOWNLOAD] {name} failed: {e}")
+                self.pending.failed(cid, path, name)
                 await asyncio.sleep(2)
-                return False
-            item.path = repair_name(path)
-            self.pending.done(item.content_id)
-            self._gone.discard(item.content_id)
-            log.info(f"[SUCCESS] Downloaded {item.path.name}")
-            return True
+                return None
+            got = repair_name(got)
+            self.pending.done(cid)
+            self._gone.discard(cid)
+            log.info(f"[SUCCESS] Downloaded {got.name}")
+            return got
 
     async def _pending_loop(self) -> None:
         while not self._stop.is_set():
@@ -1105,11 +1572,7 @@ class Player:
             if not self.player_id or self.online is False:
                 continue
             for p in self.pending.due():
-                item = next((it for it in self.engine.items if it.content_id == p.content_id), None)
-                if item is None:
-                    self.pending.done(p.content_id)
-                    continue
-                if await self._download(item):
+                if await self._download(p.content_id, p.path, p.name) is not None:
                     await self.engine.kick()
 
     # ------------------------------------------------------------------
@@ -1140,21 +1603,35 @@ class Player:
             self._refreshing = False
 
     # ------------------------------------------------------------------
-    # SSE, telemetry, info
+    # Proof of play, telemetry
     # ------------------------------------------------------------------
 
-    async def _sse_loop(self) -> None:
-        while not self._stop.is_set():
-            pid = self.player_id
-            if pid and self.online is not False:
-                try:
-                    async for data in self.cms.events(pid):
-                        await self.handle_response(data, channel="push")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    log.debug(f"[SSE] stream ended: {e}")
-            await asyncio.sleep(SSE_RECONNECT)
+    def _on_item(self, new: Optional[Item], prev: Optional[Item], reason: str) -> None:
+        """Item boundaries: proof of play (edge mode) and the wall runtime."""
+        now = (_utc_now(), time.monotonic())
+        if prev is not None and self._play_started is not None and self.edge_mode and prev.content_id:
+            started, mono = self._play_started
+            seconds = now[1] - mono
+            if seconds >= PROOF_MIN_SECONDS and self.player_id:
+                event = {"event_id": str(uuid.uuid4()), "type": "proof_of_play", "player_uuid": self.player_id,
+                         "ts": ts(now[0]), "asset_uuid": prev.content_id, "started_at": ts(started),
+                         "ended_at": ts(now[0]), "completed": reason == "completed",
+                         "duration_ms": int(seconds * 1000)}
+                if self._playlist_uuid:
+                    event["playlist_uuid"] = self._playlist_uuid
+                self.telemetry.enqueue(event)
+        self._play_started = now if new is not None else None
+        self._attach_wall(new)
+
+    def _emit_edge_event(self, level: str, code: str, message: str, detail: dict) -> None:
+        if self.player_id:
+            self.telemetry.enqueue(edge_event(self.player_id, level, code, message, detail))
+            self._telemetry_kick.set()
+
+    def _edge_transition(self, code: str, cls: str, reason: str) -> None:
+        self._emit_edge_event("warn" if code == "edge_failover" else "info", code,
+                              f"{cls} {'failed over to the cloud' if code == 'edge_failover' else 'back on the edge'}: {reason}",
+                              {"class": cls, "reason": reason})
 
     def _queue_stability_events(self) -> None:
         pid = self.player_id
@@ -1185,7 +1662,7 @@ class Player:
             except asyncio.TimeoutError:
                 pass
             self._telemetry_kick.clear()
-            if self.online is False:
+            if self.online is False and not self.edge_mode:
                 continue
             try:
                 await self._flush_telemetry()
@@ -1194,10 +1671,100 @@ class Player:
             except Exception as e:
                 log.debug(f"[TELEMETRY] flush failed: {e}")
 
+    def health_event(self) -> dict:
+        """player_health: what keeps the screen 'online' in the cloud while its
+        heartbeat goes to the edge. Unknown values are omitted, not zeroed;
+        `error` is always present (null clears it upstream)."""
+        m = metrics()
+        e = {"event_id": str(uuid.uuid4()), "type": "player_health", "player_uuid": self.player_id, "ts": ts(),
+             "status": self.engine.status()["status"], "player_version": VERSION,
+             "uptime_s": int(time.time() - self._started_wall), "error": self.compute_error()}
+        for src, dst in (("cpu_percent", "cpu_pct"), ("memory_percent", "mem_pct"),
+                         ("disk_percent", "disk_pct"), ("cpu_temp", "temp_c")):
+            if m.get(src) is not None:
+                e[dst] = m[src]
+        return e
+
+    async def _health_loop(self) -> None:
+        while not self._stop.is_set():
+            if self.player_id:
+                self.telemetry.enqueue(self.health_event())
+                self._telemetry_kick.set()
+            await asyncio.sleep(HEALTH_INTERVAL)
+
+    async def _edge_probe_loop(self) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(EDGE_PROBE_INTERVAL)
+            if self.cms.router.any_failed_over:
+                healthy = await self.cms.probe_edge()
+                self.cms.router.probe_result(healthy)
+                if healthy:
+                    self._telemetry_kick.set()
+
+    async def _inventory_loop(self) -> None:
+        await asyncio.sleep(inv.FIRST_DELAY)
+        while not self._stop.is_set():
+            pid = self.player_id
+            if pid and self.state.get("player_secret"):
+                try:
+                    body = await asyncio.to_thread(inv.collect, VERSION, self.local_ip)
+                    if self.inventory.due(body):
+                        event = dict(body, player_uuid=pid, event_id=str(uuid.uuid4()),
+                                     ts=_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"))
+                        self.telemetry.events = [e for e in self.telemetry.events if e.get("type") != "inventory"]
+                        self.telemetry.enqueue(event)
+                        self.inventory.sent(body)
+                        self._telemetry_kick.set()
+                        log.info(f"[INVENTORY] queued ({body['apps_count']} apps, "
+                                 f"{len(body['remote_access'])} remote-access tools)")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.debug(f"[INVENTORY] failed: {e}")
+            await asyncio.sleep(inv.CHECK_EVERY)
+
+    # ------------------------------------------------------------------
+    # SSE, RSS, info, network changes
+    # ------------------------------------------------------------------
+
+    async def _sse_loop(self) -> None:
+        while not self._stop.is_set():
+            pid = self.player_id
+            if pid and self.online is not False:
+                try:
+                    async for data in self.cms.events(pid):
+                        await self.handle_response(data, channel="push")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.debug(f"[SSE] stream ended: {e}")
+            await asyncio.sleep(SSE_RECONNECT)
+
+    async def _rss_loop(self) -> None:
+        await asyncio.sleep(2)
+        while not self._stop.is_set():
+            if self.online is not False and self.player_id:
+                for cid in list(self._rss_feeds):
+                    try:
+                        data = await self.cms.rss_items(cid)
+                    except Exception:
+                        data = None
+                    if data and data.get("items"):      # an empty payload never overwrites a good cache
+                        try:
+                            write_json_atomic(self.paths.rss_dir / f"{cid}.json", data)
+                        except OSError:
+                            pass
+            try:
+                await asyncio.wait_for(self._rss_wake.wait(), RSS_ONLINE if self.online is not False else RSS_OFFLINE)
+            except asyncio.TimeoutError:
+                pass
+            self._rss_wake.clear()
+
     async def _info_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                self.local_ip = await asyncio.to_thread(lan_address_for, self.settings.cms_url)
+                self.local_ip = await asyncio.to_thread(
+                    lan_address_for, self.edge_url if self.edge_mode else self.cms_url)
                 if _ndi_available():
                     self.ndi_sources = await asyncio.to_thread(ndi_engine.find_sources, timeout_ms=2000)
             except asyncio.CancelledError:
@@ -1205,6 +1772,20 @@ class Player:
             except Exception as e:
                 log.debug(f"[INFO] refresh failed: {e}")
             await asyncio.sleep(INFO_INTERVAL)
+
+    async def _net_watch_loop(self) -> None:
+        """Instant reconnect: while offline, an address change (the network
+        came up, a cable went in) retries the CMS at once instead of waiting
+        out the 15 s reconnect poll."""
+        last = address_signature()
+        while not self._stop.is_set():
+            await asyncio.sleep(NET_WATCH_INTERVAL)
+            sig = address_signature()
+            if sig != last:
+                last = sig
+                if self.online is False:
+                    log.info("[NET] network changed while offline — retrying the CMS now")
+                    self._wake.set()
 
     # ------------------------------------------------------------------
     # Preview / local API helpers (run on worker threads)
@@ -1215,11 +1796,12 @@ class Player:
             from PIL import Image, ImageGrab
         except ImportError:
             return None
-        if self.browser.running:
+        if self.page_mode or (self.mpv is None) or getattr(getattr(self.surface, "browser", None), "running", False):
             try:
                 return ImageGrab.grab(xdisplay=self.settings.display)
             except Exception as e:
                 log.debug(f"[PREVIEW] screen grab failed: {e}")
+                return None
         tmp = self.paths.preview_tmp.with_suffix(".png")
         if self.mpv.screenshot(tmp):
             try:
@@ -1247,6 +1829,7 @@ class Player:
             "ip_address": self.local_ip,
             "platform": "linux",
             "player_version": VERSION,
+            "renderer": "chromium" if self.page_mode else "mpv",
             "ndi_available": _ndi_available(),
             "preview_supported": True,
         }

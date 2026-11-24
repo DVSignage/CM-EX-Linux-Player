@@ -8,9 +8,12 @@ an RSS render) is shown unscaled.
 
 import asyncio
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Optional
+
+__all__ = ["Browser", "find_chromium", "profile_dir_for", "root_flags", "FLAGS"]
 
 log = logging.getLogger("player")
 
@@ -32,7 +35,15 @@ FLAGS = [
     "--disable-component-update",
     "--autoplay-policy=no-user-gesture-required",
     "--check-for-update-interval=31536000",
+    "--password-store=basic",
 ]
+
+
+def root_flags() -> list:
+    """Chromium will not start as root without --no-sandbox (containers,
+    a service misconfigured to run as root); players normally run as the
+    desktop user and keep the sandbox."""
+    return ["--no-sandbox"] if hasattr(os, "geteuid") and os.geteuid() == 0 else []
 
 
 def find_chromium() -> Optional[str]:
@@ -41,6 +52,18 @@ def find_chromium() -> Optional[str]:
         if path:
             return path
     return None
+
+
+def profile_dir_for(exe: str, wanted: Path) -> Path:
+    """A snap Chromium (Ubuntu) may not write hidden folders such as
+    ~/.config; its profile goes under ~/snap/chromium/common instead."""
+    try:
+        resolved = str(Path(exe).resolve())
+    except OSError:
+        resolved = exe
+    if exe.startswith("/snap/") or resolved.startswith("/snap/") or resolved.endswith("/snap"):
+        return Path.home() / "snap" / "chromium" / "common" / wanted.name
+    return wanted
 
 
 class Browser:
@@ -64,7 +87,8 @@ class Browser:
         if not exe:
             self.last_error = "no Chromium browser installed"
             return False
-        args = list(FLAGS) + [f"--display={self.display}", f"--user-data-dir={self.profile_dir}"]
+        profile = profile_dir_for(exe, self.profile_dir)
+        args = list(FLAGS) + root_flags() + [f"--display={self.display}", f"--user-data-dir={profile}"]
         if scale:
             args.append(f"--force-device-scale-factor={scale:.4f}")
         args.append(url)

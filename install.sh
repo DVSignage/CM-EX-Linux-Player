@@ -288,7 +288,13 @@ install_deps_debian() {
     apt-get update -qq
     # Install packages one-by-one so a held/broken package doesn't block the rest.
     # mpv and libmpv-dev may already be installed (and held back by PPA conflicts).
-    local pkgs=(python3 python3-pip python3-venv mpv libmpv-dev avahi-daemon libavahi-client-dev curl libgtk2.0-0)
+    local pkgs=(python3 python3-pip python3-venv mpv libmpv-dev avahi-daemon libavahi-client-dev curl libgtk2.0-0 fonts-dejavu-core)
+    # Chromium draws templates, walls and the player's screens (the renderer
+    # page). Debian ships "chromium"; Ubuntu's "chromium-browser" is a snap.
+    if ! command -v chromium &>/dev/null && ! command -v chromium-browser &>/dev/null; then
+        apt-get install -y -qq chromium 2>/dev/null || apt-get install -y -qq chromium-browser 2>/dev/null \
+            || warn "Chromium could not be installed — the player will run in mpv-only mode (no native templates or walls)"
+    fi
     local failed=()
     for pkg in "${pkgs[@]}"; do
         if dpkg -s "$pkg" &>/dev/null; then
@@ -318,20 +324,24 @@ install_deps_debian() {
 install_deps_fedora() {
     if command -v dnf &>/dev/null; then
         dnf install -y python3 python3-pip python3-virtualenv mpv mpv-libs-devel \
-            avahi avahi-devel curl
+            avahi avahi-devel curl dejavu-sans-fonts
+        dnf install -y chromium || warn "Chromium could not be installed — mpv-only mode"
     else
         yum install -y python3 python3-pip python3-virtualenv mpv mpv-libs-devel \
             avahi avahi-devel curl
+        yum install -y chromium || warn "Chromium could not be installed — mpv-only mode"
     fi
 }
 
 install_deps_arch() {
-    pacman -Syu --noconfirm --needed python python-pip mpv avahi curl
+    pacman -Syu --noconfirm --needed python python-pip mpv avahi curl ttf-dejavu
+    pacman -S --noconfirm --needed chromium || warn "Chromium could not be installed — mpv-only mode"
 }
 
 install_deps_suse() {
     zypper install -y python3 python3-pip python3-virtualenv mpv libmpv-devel \
-        avahi avahi-utils curl
+        avahi avahi-utils curl dejavu-fonts
+    zypper install -y chromium || warn "Chromium could not be installed — mpv-only mode"
 }
 
 case "$DISTRO" in

@@ -2,6 +2,7 @@ import asyncio
 
 from cmx.items import IMAGE, TEMPLATE, VIDEO, Item
 from cmx.playback import PAUSED, PLAYING, STOPPED, WAITING, PlaylistEngine
+from cmx.surface import MpvSurface
 from cmx.wall import crop_filter_normalised
 
 from conftest import MP4_HEAD, PNG_HEAD
@@ -19,8 +20,9 @@ def make_engine(mpv, browser, tmp_path):
     def resolve(item):
         return item.path if item.path and item.path.exists() else None
 
-    eng = PlaylistEngine(mpv, browser, default_image=10, resolve=resolve, blank=blank,
-                         on_waiting=on_waiting, crop_filter=crop_filter_normalised)
+    surface = MpvSurface(mpv, browser, screens_dir=tmp_path, crop_filter=crop_filter_normalised)
+    surface._black = blank
+    eng = PlaylistEngine(surface, default_image=10, resolve=resolve, on_waiting=on_waiting)
     return eng, events
 
 

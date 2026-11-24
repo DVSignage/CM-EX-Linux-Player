@@ -2,6 +2,41 @@
 
 All notable changes to the CM:EX Linux Player.
 
+## [2.1.0] - 2026-11-23
+
+The rest of the DVSI Plus CMX player's feature set. What is on screen is now
+drawn by a renderer page the player serves itself (port 8083, loopback) in a
+Chromium kiosk; mpv stays for multicast wall streams and as the fallback when
+Chromium is missing.
+
+### Added
+- Crossfades between items, with the next video preloaded; an audio-only
+  Now Playing card; an optional loading spinner and a download panel.
+- On-screen setup (cloud, or edge server + cloud failover) when no `cms_url`
+  is configured.
+- Native templates drawn from cached files, offline: text, panels, pictures,
+  clips, RSS ticker/list from a cached feed, capture elements, trigger zones
+  and nested templates (3 levels). Unknown element types use the CMS render.
+- `template_patch` (one element changed live) and in-place merge of an
+  edited template.
+- Interactive walls: a port of DVSI Plus's InteractionEngine — triggers from
+  the CMS or touch, scenes, attractors, layouts, retrigger policies, back
+  history, idle return, scheduled home scenes; `trigger`, `set_scene`,
+  `wall_play`, `alignment`; `scene_id`/`home_scene_id` in the heartbeat.
+- Live capture: `show_capture`/`hide_capture` for USB/UVC devices, capture
+  device list in the heartbeat.
+- Edge (LAN) mode: edge-first routing with cloud failover and failback,
+  edge-404 confirmation with the cloud, site check, failover telemetry.
+- Proof of play and player health telemetry (edge mode).
+- Machine inventory reporting (OS, remote-access tools, installed apps).
+- Chromium crash and hang recovery with `renderer_crash` telemetry.
+- Instant reconnect when the network changes while offline.
+- Saved-page snapshot for web items that cannot load; a separate window
+  for sites that refuse to be framed.
+
+### Changed
+- `install.sh` installs Chromium and DejaVu fonts.
+
 ## [2.0.0] - 2026-11-23
 
 Brought to parity with the DVSI Plus CMX player (core tier) and restructured

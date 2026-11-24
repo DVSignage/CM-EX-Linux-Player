@@ -30,6 +30,8 @@ class FakeCms:
         self.playlist: Optional[dict] = None
         self.media: dict = {}            # content_id -> bytes
         self.meta: dict = {}             # content_id -> content object
+        self.templates: dict = {}        # template id -> definition
+        self.rss: dict = {}              # feed content id -> items
         self.commands = deque()          # heartbeat responses to hand out
         self.acks = []
         self.beats = []
@@ -82,7 +84,12 @@ class FakeCms:
                 return self._json(self.meta[cid])
             return 404, "application/json", b"{}", {}
         if p.startswith(f"/api/v1/players/{pid}/templates/"):
+            tid = p.rsplit("/", 1)[1]
+            if self.templates:
+                return self._json(self.templates[tid]) if tid in self.templates else (404, "application/json", b"{}", {})
             return self._json({"width": 3840, "height": 2160, "elements": []})
+        if p.startswith("/api/v1/rss/") and p.endswith("/items"):
+            return self._json({"items": self.rss.get(p.split("/")[4], [])})
         return 404, "application/json", b'{"error":"not found"}', {}
 
     @staticmethod

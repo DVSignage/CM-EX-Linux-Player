@@ -38,6 +38,7 @@ class Item:
     clip_end: Optional[float] = None
     template_id: Optional[str] = None
     canvas: tuple = (0, 0)             # template render canvas (w, h); (0, 0) = responsive
+    content_hash: str = ""             # a native template's definition hash
     extra: dict = field(default_factory=dict)
 
     @property
@@ -52,8 +53,8 @@ class Item:
     def is_audio(self) -> bool:
         return self.kind == VIDEO and bool(_AUDIO_NAME.search(self.name or ""))
 
-    def signature(self) -> str:
-        """Identity for "is this the same content?". The raw clip bounds are in
+    def identity(self) -> str:
+        """The entry, without its template content. The raw clip bounds are in
         it, exactly as the CMS folds them into playlist_hash: a window moved
         10→20 ⇒ 30→40 is still 10 s long but is different content."""
         return "|".join([
@@ -61,6 +62,10 @@ class Item:
             f"{self.canvas[0]}x{self.canvas[1]}",
             f"{self.clip_start!r}→{self.clip_end!r}", self.content_id,
         ])
+
+    def signature(self) -> str:
+        """Identity plus the template's content: "is this the same content?"."""
+        return self.identity() + "|" + self.content_hash
 
     def dwell(self, default_image: float) -> float:
         """Seconds before the item advances on a timer; 0 = wait for the media
@@ -96,6 +101,14 @@ def same_content(a: Optional[List[Item]], b: Optional[List[Item]]) -> bool:
     if not a or not b or len(a) != len(b):
         return False
     return all(x.signature() == y.signature() for x, y in zip(a, b))
+
+
+def same_sequence(a: Optional[List[Item]], b: Optional[List[Item]]) -> bool:
+    """The same entries in the same order, template content aside: an edited
+    template coming back through the playlist, merged in place."""
+    if not a or not b or len(a) != len(b):
+        return False
+    return all(x.identity() == y.identity() for x, y in zip(a, b))
 
 
 def content_of(item: dict) -> dict:

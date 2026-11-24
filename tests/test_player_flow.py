@@ -93,19 +93,21 @@ def test_unknown_and_state_commands_are_acked(tmp_path):
 
     async def go():
         p = make(tmp_path, cms)
-        await p.handle_command({"command": "trigger", "command_id": "u1", "command_args": {"id": 3}})
+        await p.handle_command({"command": "reboot_machine", "command_id": "u1"})
         await p.handle_command({"command": "set_volume", "command_id": "v1",
                                 "command_args": {"volume": "35", "muted": "false"}})
         await p.handle_command({"command": "show_ndi", "command_id": "n1"})
-        await p.handle_command({"command": "trigger"})          # no id: no ack
+        await p.handle_command({"command": "trigger", "command_id": "t1", "command_args": {"id": 3}})
+        await p.handle_command({"command": "reboot_machine"})          # no id: no ack
         assert cms.acks[0]["success"] is False
-        assert cms.acks[0]["message"] == "command 'trigger' not supported by this player"
+        assert cms.acks[0]["message"] == "command 'reboot_machine' not supported by this player"
         assert cms.acks[1]["message"] == "volume 35"
         assert p.mpv.volume == (35, False)
         assert json.loads(p.paths.state.read_text())["volume"] == 35
         assert cms.acks[2] == {"success": False, "message": "show_ndi needs 'source_name'",
                                "command_id": "n1", "command": "show_ndi"}
-        assert len(cms.acks) == 3
+        assert cms.acks[3]["message"] == "no interactive template on screen"
+        assert len(cms.acks) == 4
         await p.shutdown()
 
     asyncio.run(go())

@@ -92,6 +92,17 @@ def pick_lan_address(server_host: Optional[str],
     return None
 
 
+def address_signature() -> Optional[frozenset]:
+    """The machine's current addresses; a change means the network moved."""
+    if _psutil is None:
+        return None
+    try:
+        return frozenset((name, a.address) for name, addrs in _psutil.net_if_addrs().items()
+                         for a in addrs if a.family in (socket.AF_INET, socket.AF_INET6) and name != "lo")
+    except Exception:
+        return None
+
+
 def lan_address_for(cms_url: str) -> Optional[str]:
     try:
         host = urlsplit(cms_url).hostname

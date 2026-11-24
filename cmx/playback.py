@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from . import cache as cachemod
-from .items import IMAGE, TEMPLATE, VIDEO, Item, same_content
+from .items import IMAGE, TEMPLATE, VIDEO, Item, same_content, same_sequence
 
 try:
     import mpv as _mpv_module
@@ -273,26 +273,21 @@ SUSPENDED = "suspended"   # the screen is lent to a wall stream or an NDI window
 
 
 class PlaylistEngine:
-    """Owns what is on screen. `mpv` and `browser` are injected so tests can
-    use fakes; `resolve(item)` finds an item's cached file (or None)."""
+    """Owns what is on screen, through a surface (PageSurface or MpvSurface).
+    `resolve(item)` finds an item's cached file (or None)."""
 
-    def __init__(self, mpv, browser, *, default_image: float,
+    def __init__(self, surface, *, default_image: float,
                  resolve: Callable[[Item], Optional[Path]],
-                 blank: Callable[[], None],
                  on_waiting: Callable[[], None],
-                 on_item: Optional[Callable[[Item], None]] = None,
+                 on_item: Optional[Callable[[Item, Optional[Item], str], None]] = None,
                  screen_size: Callable[[], tuple] = lambda: (1920, 1080),
-                 crop_filter: Callable[[Optional[tuple]], Optional[str]] = lambda c: None,
                  clock=time.monotonic):
-        self.mpv = mpv
-        self.browser = browser
+        self.surface = surface
         self.default_image = default_image
         self._resolve = resolve
-        self._blank = blank
         self._on_waiting = on_waiting
-        self._on_item = on_item
+        self._on_item = on_item      # (new item or None, previous item or None, why the previous ended)
         self._screen_size = screen_size
-        self._crop_filter = crop_filter
         self._clock = clock
 
         self.items: List[Item] = []
@@ -304,6 +299,9 @@ class PlaylistEngine:
         self._timer_remaining: Optional[float] = None
         self._gen = -1
         self._showing_image = False
+        self._end_reason = "interrupted"
+        self._shown: Optional[Item] = None
+        surface.set_eof_callback(self.on_eof)
 
     # -- queries -----------------------------------------------------------
 
@@ -323,19 +321,26 @@ class PlaylistEngine:
             if found is None:
                 return False
             item.path = found
+        elif item.kind == TEMPLATE:
+            # a native template waits until every file it can show is on disk
+            return all(Path(p).exists() for p in item.extra.get("deps", []))
         return True
 
     def unready(self) -> List[Item]:
         return [it for it in self.items if not self.ready(it)]
 
+    @property
+    def media_on_screen(self) -> bool:
+        item = self.current
+        return (item is not None and item.kind == VIDEO and not self._showing_image
+                and self.mode in (PLAYING, PAUSED))
+
     def status(self) -> dict:
         item = self.current
-        on_screen_media = (item is not None and item.kind == VIDEO and not self._showing_image
-                           and self.mode in (PLAYING, PAUSED))
         position = duration = None
-        if on_screen_media:
-            pos = self.mpv.time_pos
-            natural = self.mpv.duration
+        if self.media_on_screen:
+            pos = self.surface.time_pos
+            natural = self.surface.duration
             out = item.out_point if item.out_point is not None else natural
             if pos is not None:
                 position = round(max(0.0, pos - item.in_point), 1)
@@ -352,6 +357,14 @@ class PlaylistEngine:
             "playlist_index": self.index if item else None,
             "playlist_total": len(self.items),
         }
+
+    # -- what is shown (proof-of-play boundaries) ------------------------------
+
+    def _changed(self, new: Optional[Item]) -> None:
+        prev, self._shown = self._shown, new
+        reason, self._end_reason = self._end_reason, "interrupted"
+        if self._on_item and (prev is not None or new is not None):
+            self._on_item(new, prev, reason)
 
     # -- timers ------------------------------------------------------------
 
@@ -373,6 +386,7 @@ class PlaylistEngine:
             await asyncio.sleep(seconds)
         except asyncio.CancelledError:
             return
+        self._end_reason = "completed"
         await self.advance()
 
     # -- loading -----------------------------------------------------------
@@ -384,6 +398,16 @@ class PlaylistEngine:
         if same_content(self.items, items) and self.mode in (PLAYING, PAUSED, WAITING):
             if self.mode == WAITING:
                 await self.kick()
+            return False
+        if same_sequence(self.items, items) and self.mode in (PLAYING, PAUSED):
+            # an edited template: keep the place, refresh only what changed
+            before = self.current
+            self.items = list(items)
+            now = self.current
+            if before is not None and now is not None and before.content_hash != now.content_hash \
+                    and now.kind == TEMPLATE:
+                await self.surface.merge_page(now)
+                self._shown = now
             return False
         self.items = list(items)
         self.index = -1
@@ -398,11 +422,11 @@ class PlaylistEngine:
     async def release(self) -> None:
         """Drop everything (refresh's first step, re-enrollment)."""
         self._cancel_timer()
-        await self.browser.stop()
-        self.mpv.stop()
+        await self.surface.release()
         self.items = []
         self.index = -1
         self.mode = IDLE
+        self._changed(None)
 
     async def kick(self) -> None:
         """Content may have landed: start if we were waiting for it."""
@@ -412,8 +436,9 @@ class PlaylistEngine:
     async def suspend(self) -> None:
         """Lend the screen (wall stream, NDI): keep the playlist, stop showing it."""
         self._cancel_timer()
-        await self.browser.stop()
+        await self.surface.hide_page()
         self.mode = SUSPENDED
+        self._changed(None)
 
     async def resume(self) -> None:
         """Take the screen back after a suspend."""
@@ -433,10 +458,20 @@ class PlaylistEngine:
                 await self._play(i)
                 return
         self._cancel_timer()
-        await self.browser.stop()
+        await self.surface.hide_page()
         self.index = -1
         self.mode = WAITING
+        self._changed(None)
         self._on_waiting()
+
+    def _next_media(self, idx: int) -> Optional[Item]:
+        """The next ready video after idx, for the page to preload."""
+        n = len(self.items)
+        for k in range(1, n):
+            it = self.items[(idx + k) % n]
+            if self.ready(it):
+                return it if it.kind == VIDEO else None
+        return None
 
     async def _play(self, idx: int, force: bool = False) -> None:
         self._cancel_timer()
@@ -446,36 +481,30 @@ class PlaylistEngine:
         single = len(self.items) == 1
 
         if item.is_media:
-            await self.browser.stop()
             is_img = item.kind == IMAGE or cachemod.is_image_file(item.path)
             self._showing_image = is_img
-            vf = self._crop_filter(self.crop)
+            self._gen = await self.surface.show_media(
+                item, is_img, loop=single and not is_img, crop=self.crop,
+                preload=None if single else self._next_media(idx))
             if is_img:
-                self._gen = self.mpv.play_file(str(item.path), vf=vf)
                 self._arm(item.dwell(self.default_image))
-            else:
-                self._gen = self.mpv.play_file(
-                    str(item.path), loop=single, vf=vf,
-                    start=item.clip_start, end=item.out_point)
             log.info(f"Playing [{idx + 1}/{len(self.items)}] {item.name}"
-                     f"{' (clip)' if item.is_clipped else ''}{' (wall crop)' if vf else ''}")
+                     f"{' (clip)' if item.is_clipped else ''}{' (wall crop)' if self.crop else ''}")
         else:
             self._showing_image = False
-            if not (single and not force and self.browser.showing(item.url)):
-                self._blank()
-                scale = self._scale_for(item)
-                ok = await self.browser.show(item.url, scale)
+            if not (single and not force and self.surface.showing_page(item)):
+                if item.kind == TEMPLATE:
+                    item.extra.setdefault("scale", self._scale_for(item))
+                ok = await self.surface.show_page(item, force)
                 if not ok:
-                    log.error(f"Cannot show {item.kind} {item.name}: no browser")
+                    log.error(f"Cannot show {item.kind} {item.name}")
                     if not single:
                         self._arm(1.0)
-                    if self._on_item:
-                        self._on_item(item)
+                    self._changed(item)
                     return
             log.info(f"Showing {item.kind} [{idx + 1}/{len(self.items)}] {item.name}")
             self._arm(item.dwell(self.default_image))
-        if self._on_item:
-            self._on_item(item)
+        self._changed(item)
 
     def _scale_for(self, item: Item) -> Optional[float]:
         cw, ch = item.canvas
@@ -499,18 +528,19 @@ class PlaylistEngine:
         await self._start_from((self.index - 1) % len(self.items), step=-1)
 
     def on_eof(self, gen: int) -> None:
-        """mpv reached the end of the file loaded as generation `gen`."""
+        """The surface reached the end of what it loaded as generation `gen`."""
         if gen != self._gen or self.mode != PLAYING:
             return
         item = self.current
         if item is None or self._showing_image or len(self.items) <= 1:
             return
+        self._end_reason = "completed"
         asyncio.ensure_future(self.advance())
 
     def pause(self) -> None:
         if self.mode != PLAYING:
             return
-        self.mpv.pause(True)
+        self.surface.pause(True)
         if self._timer and not self._timer.done():
             remaining = max(0.0, self._timer_ends - self._clock())
             self._cancel_timer()
@@ -519,11 +549,10 @@ class PlaylistEngine:
 
     async def play(self) -> None:
         if self.mode == PAUSED:
-            self.mpv.pause(False)
+            self.surface.pause(False)
             self.mode = PLAYING
             if self._timer_remaining is not None:
-                remaining = self._timer_remaining
-                self._arm(remaining)
+                self._arm(self._timer_remaining)
         elif self.mode == STOPPED and self.items:
             self.mode = IDLE
             await self._start_from(max(0, self.index))
@@ -533,10 +562,9 @@ class PlaylistEngine:
     async def stop(self) -> None:
         """Blank, and stay blank until play / replay / next / new content."""
         self._cancel_timer()
-        await self.browser.stop()
-        self.mpv.stop()
-        self._blank()
+        await self.surface.stop()
         self.mode = STOPPED
+        self._changed(None)
 
     async def replay(self) -> tuple:
         if not self.items or self.index < 0:
@@ -553,7 +581,7 @@ class PlaylistEngine:
             return False, "seek needs 'seconds' or 'position'"
         if item.kind != VIDEO or self._showing_image:
             return False, "not seekable"
-        natural = self.mpv.duration
+        natural = self.surface.duration
         out = item.out_point if item.out_point is not None else natural
         if out is None:
             return False, "not seekable"
@@ -561,10 +589,10 @@ class PlaylistEngine:
         if position is not None:
             target = position
         else:
-            now = (self.mpv.time_pos or item.in_point) - item.in_point
+            now = (self.surface.time_pos or item.in_point) - item.in_point
             target = now + seconds
         target = max(0.0, min(target, max(0.0, length - 0.1)))
-        self.mpv.seek(item.in_point + target)
+        self.surface.seek(item.in_point + target)
         return True, f"seeked to {target:.0f}s of {length:.0f}s"
 
     def set_crop(self, crop: Optional[tuple]) -> None:
@@ -574,4 +602,4 @@ class PlaylistEngine:
         self.crop = crop
         item = self.current
         if item is not None and item.is_media and self.mode in (PLAYING, PAUSED):
-            self.mpv.set_filter(self._crop_filter(crop))
+            self.surface.set_crop(crop)

@@ -1,4 +1,4 @@
-# Digital Signage Linux Player — configuration
+# CM:EX Linux Player — configuration
 #
 # Copy this file to config.yaml and edit the values below.
 # The player searches for config.yaml in:
@@ -6,20 +6,33 @@
 #   2. /etc/signage-player/config.yaml
 #   3. ~/.config/signage-player/config.yaml
 #
-# Player identity (player_id) is stored automatically in
+# Player identity (player_id, player_secret) is stored automatically in
 # ~/.config/signage-player/state.json after enrollment.
 
-# CMS server base URL (required)
+# CMS server base URL. Leave it out to enter the address on the screen
+# instead (the setup screen, which also offers edge mode).
 cms_url: "http://cms-server:8000"
+
+# Connection mode (optional): "cloud" (default) talks to cms_url directly;
+# "edge" talks to a site edge server first and fails over to cms_url.
+# connection_mode: "edge"
+# edge_url: "http://10.0.0.5:8080"
 
 # Playback settings (optional — defaults shown)
 playback:
-  # X display to use for mpv (Linux only)
+  # X display the player draws on
   display: ":0"
-  # Audio output device — "auto" lets mpv choose
+  # Audio output device for mpv — "auto" lets mpv choose
   audio_output: "auto"
   # Default duration in seconds for images when the playlist item has duration=0
   default_image_duration: 10
+  # "auto": the renderer page in Chromium when installed (templates, walls,
+  # crossfades, capture); "mpv": mpv only
+  renderer: "auto"
+  # A small spinner while content loads
+  loading_indicator: false
+  # The animated wave behind the audio Now Playing card
+  music_wave: true
 
 # Cache (optional): how many recent playlists stay cached, so switching back
 # to one needs no re-download (1-100)

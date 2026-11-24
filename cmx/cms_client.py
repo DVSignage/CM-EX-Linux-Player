@@ -1,14 +1,15 @@
 """
 HTTP client for the CM:EX REST contract (`/api/v1`).
 
-Mirrors DVSI Plus `Cmx/CmsClient.cs`, cloud mode:
+Mirrors DVSI Plus `Cmx/CmsClient.cs`:
   - 5 s connect / 30 s request timeouts;
   - the httpx client is rebuilt every 60 s and after a transport error, so a
     connection or DNS answer cached while the network was still coming up at
     boot cannot keep the player offline for ever;
   - `X-Player-Secret` on every player-scoped request when the screen has one;
   - downloads resume a leftover `.tmp` with `Range`, and a 503 + Retry-After
-    means "not ready yet", not a failure.
+    means "not ready yet", not a failure;
+  - edge mode: requests are routed by class through EdgeRouter (cmx/edge.py).
 """
 
 import asyncio
@@ -21,12 +22,15 @@ from typing import AsyncIterator, Callable, Optional
 
 import httpx
 
+from .edge import CLOUD_ONLY, CONTROL, MEDIA, TELEMETRY, EdgeRouter
+
 log = logging.getLogger("player")
 
 CONNECT_TIMEOUT = 5.0
 REQUEST_TIMEOUT = 30.0
 CLIENT_LIFETIME = 60.0
 DOWNLOAD_CHUNK = 65536
+TELEMETRY_PATHS = ("telemetry", "events")
 
 
 class CmsError(Exception):
@@ -69,20 +73,24 @@ def parse_retry_after(value: Optional[str]) -> Optional[float]:
 
 class CmsClient:
     def __init__(self, base_url: str, secret: Callable[[], Optional[str]],
-                 transport: Optional[httpx.AsyncBaseTransport] = None):
+                 transport: Optional[httpx.AsyncBaseTransport] = None,
+                 router: Optional[EdgeRouter] = None):
         self.base_url = base_url.rstrip("/")
         self._secret = secret
         self._transport = transport   # tests inject httpx.MockTransport
+        self.router = router or EdgeRouter("cloud", "", self.base_url)
         self._client: Optional[httpx.AsyncClient] = None
         self._client_born = 0.0
         self._rebuild = False
+        self._telemetry_path: Optional[str] = None
+        self.last_from_edge = False
 
     # ------------------------------------------------------------------
-    # URLs
+    # URLs (pages a renderer loads are always built from the cloud base)
     # ------------------------------------------------------------------
 
-    def api(self, path: str) -> str:
-        return f"{self.base_url}/api/v1{path}"
+    def api(self, path: str, base: Optional[str] = None) -> str:
+        return f"{(base or self.base_url).rstrip('/')}/api/v1{path}"
 
     def stream_url(self, content_id: str) -> str:
         return self.api(f"/content/{content_id}/stream")
@@ -121,18 +129,37 @@ class CmsClient:
                 h["X-Player-Secret"] = s
         return h
 
-    async def request(self, method: str, path: str, *, player_scoped: bool = True,
-                      timeout: Optional[float] = None, headers: Optional[dict] = None,
-                      **kwargs) -> httpx.Response:
-        url = path if path.startswith("http") else self.api(path)
+    async def _send(self, method: str, url: str, player_scoped: bool, timeout, headers, **kwargs) -> httpx.Response:
         try:
             return await self._http().request(
                 method, url, headers=self._headers(player_scoped, headers),
-                timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
-                **kwargs)
+                timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT, **kwargs)
         except httpx.TransportError:
             self._rebuild = True
             raise
+
+    async def request(self, method: str, path: str, *, cls: str = CONTROL, player_scoped: bool = True,
+                      timeout: Optional[float] = None, headers: Optional[dict] = None,
+                      base: Optional[str] = None, **kwargs) -> httpx.Response:
+        """One request, routed by class in edge mode: an edge failure that
+        trips the class over is retried against the cloud straight away."""
+        if path.startswith("http"):
+            self.last_from_edge = False
+            return await self._send(method, path, player_scoped, timeout, headers, **kwargs)
+        routed = base is None and cls in (CONTROL, MEDIA) and self.router.is_edge(cls)
+        target = base or self.router.base_for(cls)
+        self.last_from_edge = routed or (base is None and cls == TELEMETRY and self.router.enabled)
+        try:
+            r = await self._send(method, self.api(path, target), player_scoped, timeout, headers, **kwargs)
+        except (httpx.TransportError, httpx.TimeoutException):
+            if routed and self.router.record(cls, None):
+                self.last_from_edge = False
+                return await self._send(method, self.api(path), player_scoped, timeout, headers, **kwargs)
+            raise
+        if routed and self.router.record(cls, r.status_code, parse_retry_after(r.headers.get("Retry-After"))):
+            self.last_from_edge = False
+            return await self._send(method, self.api(path), player_scoped, timeout, headers, **kwargs)
+        return r
 
     async def aclose(self) -> None:
         if self._client is not None and not self._client.is_closed:
@@ -143,6 +170,18 @@ class CmsClient:
         if not r.content or not r.content.strip():
             return None
         return r.json()
+
+    async def _edge_then_cloud(self, path: str) -> httpx.Response:
+        """CLOUD_ONLY reads: the edge once first (outside the failure count),
+        the cloud when the edge has no answer."""
+        if self.router.enabled:
+            try:
+                r = await self._send("GET", self.api(path, self.router.edge_url), True, 10, None)
+                if r.status_code == 200:
+                    return r
+            except (httpx.TransportError, httpx.TimeoutException):
+                pass
+        return await self.request("GET", path, cls=CLOUD_ONLY)
 
     # ------------------------------------------------------------------
     # Enrollment
@@ -165,10 +204,14 @@ class CmsClient:
     # Player routines
     # ------------------------------------------------------------------
 
-    async def heartbeat(self, player_id: str, body: dict,
-                        timeout: Optional[float] = None) -> httpx.Response:
-        return await self.request("POST", f"/players/{player_id}/heartbeat",
-                                  json=body, timeout=timeout)
+    async def heartbeat(self, player_id: str, body: dict, timeout: Optional[float] = None) -> httpx.Response:
+        return await self.request("POST", f"/players/{player_id}/heartbeat", json=body, timeout=timeout)
+
+    async def heartbeat_cloud(self, player_id: str, body: dict, timeout: Optional[float] = 5) -> httpx.Response:
+        """A heartbeat straight to the cloud, bypassing the router: is this
+        player really deleted, or is the edge's replica just behind?"""
+        return await self.request("POST", f"/players/{player_id}/heartbeat", json=body,
+                                  timeout=timeout, base=self.base_url)
 
     async def assigned_playlist(self, player_id: str) -> Optional[dict]:
         """The assigned playlist, or None when nothing is assigned (a bare
@@ -178,12 +221,10 @@ class CmsClient:
         data = self._json(r)
         return data if isinstance(data, dict) else None
 
-    async def ack(self, player_id: str, command_id, command: str,
-                  success: bool, message: str) -> bool:
+    async def ack(self, player_id: str, command_id, command: str, success: bool, message: str) -> bool:
         """POST the result of an enveloped command. One retry after 500 ms on
         a transport error or 5xx; a 4xx ("I never issued that id") is final."""
-        body = {"success": bool(success), "message": message,
-                "command_id": command_id, "command": command}
+        body = {"success": bool(success), "message": message, "command_id": command_id, "command": command}
         for attempt in (1, 2):
             try:
                 r = await self.request("POST", f"/players/{player_id}/ack", json=body)
@@ -210,7 +251,7 @@ class CmsClient:
         return False
 
     async def content_meta(self, content_id: str) -> dict:
-        r = await self.request("GET", f"/content/{content_id}")
+        r = await self._edge_then_cloud(f"/content/{content_id}")
         if r.status_code == 429:
             raise RateLimited(parse_retry_after(r.headers.get("Retry-After")))
         r.raise_for_status()
@@ -219,10 +260,9 @@ class CmsClient:
 
     async def template_definition(self, player_id: str, template_id: str) -> Optional[dict]:
         """The player-scoped read first (no CMS login needed), then the plain one."""
-        for path in (f"/players/{player_id}/templates/{template_id}",
-                     f"/templates/{template_id}"):
+        for path in (f"/players/{player_id}/templates/{template_id}", f"/templates/{template_id}"):
             try:
-                r = await self.request("GET", path)
+                r = await self._edge_then_cloud(path)
             except (httpx.TransportError, httpx.TimeoutException):
                 return None
             if r.status_code == 200:
@@ -231,18 +271,39 @@ class CmsClient:
                     return data
         return None
 
+    async def rss_items(self, content_id: str) -> Optional[dict]:
+        r = await self._edge_then_cloud(f"/rss/{content_id}/items")
+        if r.status_code != 200:
+            return None
+        data = self._json(r)
+        return data if isinstance(data, dict) else None
+
     async def telemetry(self, player_id: str, events: list) -> httpx.Response:
-        # The body is an object: a bare array reads as "no events" upstream.
-        return await self.request("POST", f"/players/{player_id}/telemetry",
-                                  json={"events": events}, timeout=10)
+        """POST telemetry (`{"events": [...]}` — a bare array reads as nothing).
+        Edge mode: `/telemetry`, falling back to `/events` on a 404, the path
+        that answers remembered (forgotten again on 404/405). Cloud mode:
+        `/telemetry` only — `/events` there is the SSE stream."""
+        body = {"events": events}
+        if not self.router.enabled:
+            return await self.request("POST", f"/players/{player_id}/telemetry", cls=TELEMETRY, json=body, timeout=10)
+        paths = [self._telemetry_path] if self._telemetry_path else list(TELEMETRY_PATHS)
+        r = None
+        for p in paths:
+            r = await self.request("POST", f"/players/{player_id}/{p}", cls=TELEMETRY, json=body, timeout=10)
+            if r.status_code in (404, 405):
+                self._telemetry_path = None
+                continue
+            if 200 <= r.status_code < 300:
+                self._telemetry_path = p
+            return r
+        return r
 
     async def preview_frame(self, player_id: str, jpeg: bytes) -> Optional[bool]:
-        """POST one preview JPEG. Returns whether someone is still watching,
-        or None when the CMS refused the frame."""
+        """POST one preview JPEG, straight to the cloud. Returns whether
+        someone is still watching, or None when the CMS refused the frame."""
         try:
-            r = await self.request("POST", f"/players/{player_id}/preview-frame",
-                                   content=jpeg, headers={"Content-Type": "image/jpeg"},
-                                   timeout=8)
+            r = await self.request("POST", f"/players/{player_id}/preview-frame", base=self.base_url,
+                                   content=jpeg, headers={"Content-Type": "image/jpeg"}, timeout=8)
         except (httpx.TransportError, httpx.TimeoutException):
             return None
         if not 200 <= r.status_code < 300:
@@ -253,10 +314,35 @@ class CmsClient:
             data = {}
         return bool(data.get("watching", True)) if isinstance(data, dict) else True
 
+    async def site_info(self) -> Optional[dict]:
+        """The edge's own idea of the venue it serves (edge mode)."""
+        if not self.router.enabled:
+            return None
+        try:
+            r = await self._send("GET", self.api("/site", self.router.edge_url), False, 5, None)
+            return self._json(r) if r.status_code == 200 else None
+        except (httpx.TransportError, httpx.TimeoutException, ValueError):
+            return None
+
+    async def probe_edge(self) -> bool:
+        """`/api/v1/healthz` then `/healthz`: 2xx = up; 404 on both = up too."""
+        base = self.router.edge_url
+        statuses = []
+        for url in (f"{base}/api/v1/healthz", f"{base}/healthz"):
+            try:
+                r = await self._send("GET", url, False, 5, None)
+            except (httpx.TransportError, httpx.TimeoutException):
+                return False
+            if 200 <= r.status_code < 300:
+                return True
+            statuses.append(r.status_code)
+        return all(s == 404 for s in statuses)
+
     async def events(self, player_id: str) -> AsyncIterator[dict]:
         """The SSE push channel: one JSON object per `data:` line. The request
         timeout covers the response headers only; reads wait indefinitely."""
-        url = self.api(f"/players/{player_id}/events")
+        base = self.router.base_for(CONTROL)
+        url = self.api(f"/players/{player_id}/events", base)
         timeout = httpx.Timeout(REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT, read=None)
         headers = self._headers(True, {"Accept": "text/event-stream"})
         try:
@@ -276,6 +362,8 @@ class CmsClient:
                         yield data
         except httpx.TransportError:
             self._rebuild = True
+            if self.router.is_edge(CONTROL):
+                self.router.record(CONTROL, None)
             raise
 
     # ------------------------------------------------------------------
@@ -288,19 +376,33 @@ class CmsClient:
 
         206 appends; 200 restarts the .tmp; 416 deletes it (the next try
         starts clean). Raises ContentNotReady (503), ContentGone (404/410),
-        RateLimited (429) or CmsError."""
+        RateLimited (429) or CmsError. Edge mode: MEDIA class, failing over."""
+        edge = self.router.is_edge(MEDIA)
+        try:
+            return await self._download_from(self.router.base_for(MEDIA), content_id, dest, progress, edge)
+        except (httpx.TransportError, httpx.TimeoutException):
+            if edge and self.router.record(MEDIA, None):
+                return await self._download_from(self.base_url, content_id, dest, progress, False)
+            raise
+        except _EdgeTripped:
+            return await self._download_from(self.base_url, content_id, dest, progress, False)
+
+    async def _download_from(self, base: str, content_id: str, dest: Path, progress, edge: bool) -> Path:
         tmp = Path(str(dest) + ".tmp")
         have = tmp.stat().st_size if tmp.exists() else 0
         headers = {"Range": f"bytes={have}-"} if have > 0 else {}
-        url = self.stream_url(content_id)
+        url = self.api(f"/content/{content_id}/stream", base)
         try:
             async with self._http().stream("GET", url, headers=self._headers(True, headers)) as r:
+                retry_after = parse_retry_after(r.headers.get("Retry-After"))
+                if edge and self.router.record(MEDIA, r.status_code, retry_after):
+                    raise _EdgeTripped()
                 if r.status_code == 503:
-                    raise ContentNotReady(parse_retry_after(r.headers.get("Retry-After")))
+                    raise ContentNotReady(retry_after)
                 if r.status_code in (404, 410):
                     raise ContentGone(f"HTTP {r.status_code}")
                 if r.status_code == 429:
-                    raise RateLimited(parse_retry_after(r.headers.get("Retry-After")))
+                    raise RateLimited(retry_after)
                 if r.status_code == 416:
                     tmp.unlink(missing_ok=True)
                     raise CmsError("range not satisfiable — partial file discarded")
@@ -327,3 +429,7 @@ class CmsClient:
             raise
         tmp.replace(dest)
         return dest
+
+
+class _EdgeTripped(Exception):
+    """The edge's answer tripped MEDIA over to the cloud: retry there."""

@@ -71,8 +71,20 @@ class Paths:
     def browser_profile(self) -> Path:
         return self.base / "chromium-profile"
 
+    @property
+    def kiosk_profile(self) -> Path:
+        return self.base / "kiosk-profile"
+
+    @property
+    def rss_dir(self) -> Path:
+        return self.base / "rss"
+
+    @property
+    def inventory_state(self) -> Path:
+        return self.base / "inventory-state.json"
+
     def ensure(self) -> None:
-        for d in (self.base, self.cache_dir, self.crash_dir, self.screens_dir):
+        for d in (self.base, self.cache_dir, self.crash_dir, self.screens_dir, self.rss_dir):
             d.mkdir(parents=True, exist_ok=True)
 
 
@@ -86,11 +98,23 @@ class Settings:
     default_image_duration: int = 10
     log_level: str = "INFO"
     keep_playlists: int = 10
+    renderer: str = "auto"          # "auto": Chromium page when installed; "mpv": mpv only
+    loading_indicator: bool = False
+    music_wave: bool = True
+    connection_mode: str = ""       # "cloud" | "edge"; empty = from state (setup screen) or cloud
+    edge_url: str = ""
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "Settings":
         pb = cfg.get("playback") or {}
         cache = cfg.get("cache") or {}
+
+        def flag(v, default):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.strip().lower() in ("1", "true", "yes", "on")
+            return default
         try:
             img = int(pb.get("default_image_duration", 10))
         except (TypeError, ValueError):
@@ -106,6 +130,11 @@ class Settings:
             default_image_duration=img if img > 0 else 10,
             log_level=str(cfg.get("log_level") or "INFO").upper(),
             keep_playlists=min(100, max(1, keep)),
+            renderer=str(pb.get("renderer") or "auto").lower(),
+            loading_indicator=flag(pb.get("loading_indicator"), False),
+            music_wave=flag(pb.get("music_wave"), True),
+            connection_mode=str(cfg.get("connection_mode") or "").lower(),
+            edge_url=str(cfg.get("edge_url") or "").strip().rstrip("/"),
         )
 
 
