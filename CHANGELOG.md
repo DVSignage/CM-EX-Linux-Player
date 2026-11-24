@@ -2,6 +2,25 @@
 
 All notable changes to the CM:EX Linux Player.
 
+## [2.4.0] - 2026-11-24
+
+### Added
+- A/V offset for live capture (`av_offset_ms` and its DVSI aliases, ±500 ms):
+  positive holds the picture back, negative delays the sound through Web
+  Audio. A changed offset for the device on screen applies live, without
+  reopening it; the heartbeat reports `av_offset_ms` / `av_hold_ms`.
+- Port-conflict reporting: a port the player cannot bind (local API 8081,
+  control API 8083, renderer 8090) names the program holding it in the
+  heartbeat `error`, sends `port_conflict` / `port_conflict_cleared` edge
+  events, and is retried every 30 s.
+- Reset registration: Ctrl+Alt+Shift+R then Y at the screen, or
+  `POST /api/reset-registration` (this machine, `X-Local-Key`). Clears the
+  identity, cache and offline copy; back to the setup screen or a new code.
+
+### Changed
+- An inventory the CMS refuses for good is sent only once a day until the
+  player version changes.
+
 ## [2.3.0] - 2026-11-24
 
 ### Added
