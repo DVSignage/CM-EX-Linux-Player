@@ -16,7 +16,7 @@ def _requirements(name: str) -> list:
 
 setup(
     name="signage-player",
-    version="2.1.1",
+    version="2.2.0",
     description="CM:EX Linux digital signage player",
     long_description=(HERE / "README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",

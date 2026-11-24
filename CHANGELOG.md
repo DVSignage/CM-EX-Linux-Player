@@ -2,6 +2,21 @@
 
 All notable changes to the CM:EX Linux Player.
 
+## [2.2.0] - 2026-11-24
+
+### Added
+- Control API on port 8083, as on DVSI Plus: interactive-wall routes for LAN
+  sensors, touch panels and show controllers (`/api/trigger`, `/api/scene`,
+  `/api/home`, `/api/back`, `/api/play-content`, `/api/alignment`,
+  `/api/patch`, `GET /api/interaction`), and key-protected play / pause /
+  restart, device, preview, capture and NDI routes for this machine. Loopback
+  unless `lan_api.enabled`; `lan_api.trigger_key` protects the LAN routes.
+  Access rules ported from DVSI Plus LocalApiPolicy, case for case.
+
+### Changed
+- The renderer page moved from port 8083 to 8090 (loopback) to free 8083.
+- `install.sh` opens port 8083 in ufw.
+
 ## [2.1.1] - 2026-11-24
 
 Checked against the real CM:EX server: 16 real template definitions, the
