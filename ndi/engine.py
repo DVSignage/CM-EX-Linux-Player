@@ -7,7 +7,6 @@ and send (broadcast player output as NDI source).
 Gracefully disabled if ndi-python or opencv are not installed.
 """
 
-import asyncio
 import logging
 import threading
 import time
@@ -382,21 +381,26 @@ class NDISender:
             log.error(f"[NDI SEND] Failed to create sender: {e}")
             return False
 
-    def send_frame(self, frame: "np.ndarray") -> None:
+    def send_frame(self, frame: "np.ndarray", fps: int = 30) -> bool:
         """
         Send a single video frame.
         frame: numpy array of shape (height, width, 4) dtype=uint8, BGRA format.
+        NDI reads the buffer as raw memory, so it must be C-contiguous.
         """
         if not self._active or not self._send:
-            return
+            return False
 
         try:
             video_frame = ndi.VideoFrameV2()
-            video_frame.data = frame
+            video_frame.data = np.ascontiguousarray(frame)
             video_frame.FourCC = ndi.FOURCC_VIDEO_TYPE_BGRA
+            video_frame.frame_rate_N = int(fps)
+            video_frame.frame_rate_D = 1
             ndi.send_send_video_v2(self._send, video_frame)
+            return True
         except Exception as e:
             log.error(f"[NDI SEND] Frame send error: {e}")
+            return False
 
     def stop(self) -> None:
         """Stop broadcasting."""

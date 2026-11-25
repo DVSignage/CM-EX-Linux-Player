@@ -1,0 +1,44 @@
+{
+ "id": "cfd09852-4ea6-4404-8aad-bb6898e36bc8",
+ "width": 3840,
+ "height": 1080,
+ "background_color": null,
+ "background_image_id": null,
+ "elements": [
+  {
+   "id": "f73e2d3e-080c-429d-a319-edcea2184d0c",
+   "type": "web",
+   "label": null,
+   "x": 64,
+   "y": 108,
+   "width": 1598,
+   "height": 865,
+   "rotation": 0,
+   "zIndex": 1,
+   "props": {
+    "src": "http://cms.example/api/v1/templates/00000000-0000-0000-0000-000000000000/preview?live=1",
+    "transparent": true,
+    "allow": "autoplay; fullscreen"
+   }
+  },
+  {
+   "id": "80f6f7de-f540-4b9b-898c-01e819b14b35",
+   "type": "web",
+   "label": null,
+   "x": 2048,
+   "y": 157,
+   "width": 1400,
+   "height": 795,
+   "rotation": 0,
+   "zIndex": 2,
+   "props": {
+    "src": "http://cms.example/api/v1/templates/00000000-0000-0000-0000-000000000000/preview?live=1",
+    "transparent": true,
+    "allow": "autoplay; fullscreen"
+   }
+  }
+ ],
+ "interaction": null,
+ "timezone": "Asia/Manila",
+ "name": "web elements"
+}

@@ -1,0 +1,133 @@
+{
+ "id": "8d179144-4c7a-473f-bbfd-9ea820078e6b",
+ "width": 3840,
+ "height": 2160,
+ "background_color": null,
+ "background_image_id": null,
+ "elements": [
+  {
+   "id": "6a123cec-f97b-4f23-bb95-240ac688bc41",
+   "type": "capture",
+   "label": null,
+   "x": 1920,
+   "y": 1080,
+   "width": 1920,
+   "height": 1080,
+   "rotation": 0,
+   "zIndex": 1,
+   "props": {
+    "deviceLabel": "HD Pro Webcam C920",
+    "objectFit": "cover",
+    "opacity": 1
+   }
+  },
+  {
+   "id": "79208e7a-dea6-43e9-a43f-9615b93e7688",
+   "type": "video",
+   "label": null,
+   "x": 0,
+   "y": 0,
+   "width": 1920,
+   "height": 1080,
+   "rotation": 0,
+   "zIndex": 2,
+   "props": {
+    "contentId": "08a84281-9037-4eab-8361-e3c06fef0906",
+    "muted": false,
+    "loop": true,
+    "objectFit": "cover"
+   }
+  },
+  {
+   "id": "2d482294-9bb4-4f9a-82ab-6ed4bfffc1f7",
+   "type": "image",
+   "label": null,
+   "x": 1920,
+   "y": 0,
+   "width": 1920,
+   "height": 1080,
+   "rotation": 0,
+   "zIndex": 3,
+   "props": {
+    "contentId": "bb14712f-8c90-45a6-bcaa-ed2a77748747",
+    "objectFit": "cover"
+   }
+  },
+  {
+   "id": "2db1860a-713e-4d45-9c60-deee1fc5ce09",
+   "type": "rss",
+   "label": null,
+   "x": 0,
+   "y": 2070,
+   "width": 3840,
+   "height": 90,
+   "rotation": 0,
+   "zIndex": 4,
+   "props": {
+    "contentId": "7289b271-6cbc-46a9-8dde-6a3c8c414387",
+    "mode": "ticker",
+    "animation": "scroll",
+    "maxItems": 10,
+    "itemDurationS": 8,
+    "speedPxS": 90,
+    "separator": " • ",
+    "showImages": false,
+    "showTimestamps": false,
+    "fontSize": 32,
+    "fontFamily": "Inter, sans-serif",
+    "fontWeight": "800",
+    "color": "#60f410",
+    "backgroundColor": "rgba(0,0,0,0.6)"
+   }
+  },
+  {
+   "id": "c0e75ef5-6ba2-4729-b092-10fda872d370",
+   "type": "rss",
+   "label": null,
+   "x": 26,
+   "y": 1080,
+   "width": 1897,
+   "height": 989,
+   "rotation": 0,
+   "zIndex": 5,
+   "props": {
+    "contentId": "7289b271-6cbc-46a9-8dde-6a3c8c414387",
+    "mode": "list",
+    "animation": "slide",
+    "maxItems": 12,
+    "itemDurationS": 8,
+    "speedPxS": 90,
+    "separator": " • ",
+    "showImages": false,
+    "showTimestamps": true,
+    "fontSize": 22,
+    "fontFamily": "Inter, sans-serif",
+    "fontWeight": "600",
+    "color": "#d1ca00",
+    "backgroundColor": "transparent",
+    "backgroundOpacity": 100
+   }
+  },
+  {
+   "id": "6503d56e-3df5-4375-9d5e-ab02503bfdf4",
+   "type": "text",
+   "label": null,
+   "x": 2730,
+   "y": 1102,
+   "width": 300,
+   "height": 60,
+   "rotation": 0,
+   "zIndex": 6,
+   "props": {
+    "content": "Sample text 1",
+    "fontSize": 24,
+    "color": "#ffffff",
+    "fontFamily": "Arial, sans-serif",
+    "align": "center"
+   }
+  }
+ ],
+ "interaction": null,
+ "timezone": "Asia/Manila",
+ "name": "rss capture video"
+}

@@ -103,6 +103,27 @@ def address_signature() -> Optional[frozenset]:
         return None
 
 
+def port_holder(port: int) -> Optional[str]:
+    """The program listening on a TCP port, when this user may see it."""
+    if _psutil is None:
+        return None
+    try:
+        for c in _psutil.net_connections(kind="tcp"):
+            if c.laddr and c.laddr.port == port and c.status == _psutil.CONN_LISTEN and c.pid:
+                try:
+                    return _psutil.Process(c.pid).name()
+                except Exception:
+                    return f"pid {c.pid}"
+    except Exception:
+        pass
+    return None
+
+
+def port_conflict_message(service: str, port: int, holder: Optional[str]) -> str:
+    """The heartbeat's wording, as DVSI Plus reports it."""
+    return f"port conflict: {service} tcp port {port} is held by " + (holder or "another program")
+
+
 def lan_address_for(cms_url: str) -> Optional[str]:
     try:
         host = urlsplit(cms_url).hostname

@@ -1,0 +1,362 @@
+{
+ "id": "30d26bbe-446b-4453-a547-34d6f3c5aef9",
+ "width": 1920,
+ "height": 1080,
+ "background_color": null,
+ "background_image_id": null,
+ "elements": [
+  {
+   "id": "59e04992-3455-47eb-8c30-aae7c0419ecb",
+   "type": "panel",
+   "label": null,
+   "x": 0,
+   "y": 0,
+   "width": 1920,
+   "height": 1080,
+   "rotation": 0,
+   "zIndex": 1,
+   "props": {
+    "backgroundColor": "#0b1220",
+    "borderRadius": 0,
+    "opacity": 1
+   }
+  },
+  {
+   "id": "cd88ade5-7510-49cf-baa3-fd65c84f6dd6",
+   "type": "trigger_zone",
+   "label": null,
+   "x": 60,
+   "y": 60,
+   "width": 880,
+   "height": 495,
+   "rotation": 0,
+   "zIndex": 5,
+   "props": {
+    "triggerId": 1,
+    "fit": "fill",
+    "attractorContentId": null
+   }
+  },
+  {
+   "id": "cc34399c-094f-4d45-a2e6-68136ecf738e",
+   "type": "panel",
+   "label": null,
+   "x": 980,
+   "y": 60,
+   "width": 880,
+   "height": 495,
+   "rotation": 0,
+   "zIndex": 3,
+   "props": {
+    "backgroundColor": "#1f2937",
+    "borderRadius": 12,
+    "opacity": 1,
+    "triggerId": 2
+   }
+  },
+  {
+   "id": "6cecfbfb-990f-4bc2-9fbb-c9dae9caa311",
+   "type": "image",
+   "label": null,
+   "x": 1000,
+   "y": 80,
+   "width": 840,
+   "height": 360,
+   "rotation": 0,
+   "zIndex": 4,
+   "props": {
+    "contentId": "68b96402-deac-4623-8c1e-a8f78d241c82",
+    "objectFit": "cover"
+   }
+  },
+  {
+   "id": "0b7ac4e1-540f-4510-953e-b79ddf472918",
+   "type": "text",
+   "label": null,
+   "x": 1000,
+   "y": 455,
+   "width": 840,
+   "height": 80,
+   "rotation": 0,
+   "zIndex": 4,
+   "props": {
+    "content": "Sample text 1",
+    "fontSize": 44,
+    "color": "#ffffff",
+    "align": "center",
+    "fontFamily": "Arial, sans-serif"
+   }
+  },
+  {
+   "id": "89f13ad6-2aac-4292-99a3-1603f304514c",
+   "type": "text",
+   "label": null,
+   "x": 60,
+   "y": 600,
+   "width": 400,
+   "height": 100,
+   "rotation": 0,
+   "zIndex": 4,
+   "props": {
+    "content": "Sample text 2",
+    "fontSize": 48,
+    "color": "#16EB87",
+    "backgroundColor": "#111827",
+    "align": "center",
+    "fontFamily": "Arial, sans-serif",
+    "triggerId": 3
+   }
+  },
+  {
+   "id": "fd743b2a-a468-43dc-962e-c20088623703",
+   "type": "text",
+   "label": null,
+   "x": 60,
+   "y": 760,
+   "width": 800,
+   "height": 120,
+   "rotation": 0,
+   "zIndex": 4,
+   "props": {
+    "content": "Sample text 3",
+    "fontSize": 56,
+    "color": "#ffffff",
+    "fontFamily": "Arial, sans-serif"
+   }
+  },
+  {
+   "id": "73d89b90-8d93-4eb9-9566-baadafc43174",
+   "type": "trigger_zone",
+   "label": null,
+   "x": 1622,
+   "y": 1016,
+   "width": 298,
+   "height": 64,
+   "rotation": 0,
+   "zIndex": 8,
+   "props": {
+    "triggerId": 5,
+    "fit": "fill",
+    "attractorContentId": null
+   }
+  },
+  {
+   "id": "4d1bb232-99b0-4044-a0f3-7459043f0d2e",
+   "type": "trigger_zone",
+   "label": null,
+   "x": 1093,
+   "y": 663,
+   "width": 540,
+   "height": 267,
+   "rotation": 0,
+   "zIndex": 9,
+   "props": {
+    "triggerId": 1,
+    "fit": "fill",
+    "attractorContentId": null
+   }
+  },
+  {
+   "id": "17a31564-a02c-40e3-9c36-8a14b23d1c17",
+   "type": "video",
+   "label": null,
+   "x": 660,
+   "y": 600,
+   "width": 320,
+   "height": 180,
+   "rotation": 0,
+   "zIndex": 10,
+   "props": {
+    "muted": true,
+    "loop": true,
+    "contentId": "08a84281-9037-4eab-8361-e3c06fef0906"
+   }
+  },
+  {
+   "id": "cae4d2db-b9f3-49e0-ac09-5ba619d6cce1",
+   "type": "trigger_zone",
+   "label": null,
+   "x": 720,
+   "y": 405,
+   "width": 480,
+   "height": 270,
+   "rotation": 0,
+   "zIndex": 11,
+   "props": {
+    "triggerId": 7,
+    "fit": "fill",
+    "attractorContentId": null
+   }
+  }
+ ],
+ "interaction": {
+  "version": 1,
+  "triggers": [
+   {
+    "id": 1,
+    "label": "Trigger 1"
+   },
+   {
+    "id": 2,
+    "label": "Trigger 2"
+   },
+   {
+    "id": 3,
+    "label": "Trigger 3"
+   },
+   {
+    "id": 4,
+    "label": "Trigger 4"
+   },
+   {
+    "id": 5,
+    "label": "Trigger 5"
+   },
+   {
+    "id": 6,
+    "label": "Trigger 6"
+   },
+   {
+    "id": 7,
+    "label": "Trigger 7"
+   }
+  ],
+  "rootSceneId": "scene_main",
+  "scenes": [
+   {
+    "id": "scene_main",
+    "name": "scene_main",
+    "parentId": null,
+    "idleTimeoutS": null,
+    "mappings": [
+     {
+      "triggerId": 1,
+      "contentId": "24ad94ca-6364-4252-bd53-cc12965c3a4a",
+      "durationS": 4,
+      "then": null,
+      "target": null
+     },
+     {
+      "triggerId": 2,
+      "contentId": "08a84281-9037-4eab-8361-e3c06fef0906",
+      "durationS": null,
+      "then": {
+       "scene": "scene_promo"
+      },
+      "target": {
+       "kind": "fullscreen",
+       "fit": "fit"
+      }
+     },
+     {
+      "triggerId": 4,
+      "contentId": "68b96402-deac-4623-8c1e-a8f78d241c82",
+      "durationS": 3,
+      "then": null,
+      "target": {
+       "kind": "fullscreen",
+       "fit": "fit"
+      }
+     },
+     {
+      "triggerId": 5,
+      "contentId": null,
+      "durationS": null,
+      "then": {
+       "scene": "scene_promo"
+      },
+      "target": null
+     },
+     {
+      "triggerId": 6,
+      "contentId": "08a84281-9037-4eab-8361-e3c06fef0906",
+      "durationS": null,
+      "then": null,
+      "target": {
+       "kind": "fullscreen",
+       "fit": "fit"
+      }
+     }
+    ],
+    "attractor": null,
+    "layout": null
+   },
+   {
+    "id": "scene_promo",
+    "name": "scene_promo",
+    "parentId": "scene_main",
+    "idleTimeoutS": 60,
+    "mappings": [
+     {
+      "triggerId": 2,
+      "contentId": "13ee0a8f-8067-4712-b917-f2122a844287",
+      "durationS": null,
+      "then": null,
+      "target": {
+       "kind": "zone",
+       "elementId": "cd88ade5-7510-49cf-baa3-fd65c84f6dd6"
+      }
+     },
+     {
+      "triggerId": 3,
+      "contentId": null,
+      "durationS": null,
+      "then": {
+       "scene": "parent"
+      },
+      "target": null
+     }
+    ],
+    "attractor": null,
+    "layout": {
+     "fd743b2a-a468-43dc-962e-c20088623703": {
+      "x": 1000,
+      "y": null,
+      "width": 860,
+      "height": null,
+      "visible": null,
+      "content": "Scene text",
+      "contentId": null
+     },
+     "cc34399c-094f-4d45-a2e6-68136ecf738e": {
+      "x": 980,
+      "y": 60,
+      "width": null,
+      "height": null,
+      "visible": null,
+      "content": "Scene text",
+      "contentId": null
+     },
+     "cd88ade5-7510-49cf-baa3-fd65c84f6dd6": {
+      "x": 60,
+      "y": 60,
+      "width": null,
+      "height": null,
+      "visible": null,
+      "content": "Scene text",
+      "contentId": null
+     },
+     "0b7ac4e1-540f-4510-953e-b79ddf472918": {
+      "x": 1000,
+      "y": 460,
+      "width": null,
+      "height": null,
+      "visible": false,
+      "content": "Scene text",
+      "contentId": null
+     }
+    }
+   }
+  ],
+  "policy": {
+   "retrigger": "restart",
+   "debounceMs": 300,
+   "fadeMs": 400,
+   "touch": true,
+   "sharedTriggerIds": true
+  },
+  "schedule": []
+ },
+ "timezone": "Asia/Manila",
+ "name": "shared triggers touch"
+}

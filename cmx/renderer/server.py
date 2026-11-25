@@ -1,7 +1,7 @@
 """
 The renderer server: the local web page Chromium shows full screen.
 
-Loopback only (127.0.0.1). It serves
+Loopback only (127.0.0.1:8090 — 8083 is the control API, as on DVSI Plus). It serves
   /                  the renderer page (index.html, /static/*)
   /media/<name>      files from the content cache, with Range (video seeking)
   /screens/<name>    generated pictures (the enrollment QR code)
@@ -28,7 +28,7 @@ from urllib.parse import unquote
 
 log = logging.getLogger("player")
 
-PORT = 8083
+PORT = 8090
 STATIC_DIR = Path(__file__).parent / "static"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._\-]+$")
 # Message types that describe what is on screen; the latest of each group is

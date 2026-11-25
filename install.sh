@@ -22,6 +22,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 ARG_CMS_URL=""
 ARG_USER=""
+ARG_AUTOLOGIN=0
+WAYLAND_SESSION=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -29,12 +31,15 @@ while [[ $# -gt 0 ]]; do
             ARG_CMS_URL="$2"; shift 2 ;;
         --user)
             ARG_USER="$2"; shift 2 ;;
+        --autologin)
+            ARG_AUTOLOGIN=1; shift ;;
         --help|-h)
             echo "Usage: sudo bash install.sh [OPTIONS]"
             echo ""
             echo "Options:"
             echo "  --cms URL    CMS server URL (e.g. http://10.0.0.5:8000)"
             echo "  --user NAME  Desktop user (auto-detected if omitted)"
+            echo "  --autologin  Log the desktop user in automatically at boot (GDM / LightDM)"
             echo "  --help       Show this help"
             echo ""
             echo "Examples:"
@@ -143,6 +148,22 @@ detect_desktop_user
 # Auto-detect X11 display and Xauthority
 # ---------------------------------------------------------------------------
 detect_display() {
+    # GNOME/KDE on Wayland: the player uses XWayland, whose auth file
+    # (/run/user/<uid>/.mutter-Xwaylandauth.*) gets a new random name at every
+    # login — so it is NOT written into the service; the player finds the live
+    # one when it starts (cmx/display.py).
+    if ps aux | grep -q '[X]wayland' || ls /run/user/"$DESKTOP_UID"/wayland-* &>/dev/null; then
+        WAYLAND_SESSION=1
+        local xw_cmd
+        xw_cmd=$(ps aux | grep '[X]wayland' | head -1)
+        if echo "$xw_cmd" | grep -qE ' :[0-9]+'; then
+            X_DISPLAY=$(echo "$xw_cmd" | grep -oE ' :[0-9]+' | head -1 | tr -d ' ')
+        fi
+        XAUTH_PATH=""
+        ok "Wayland session — display ${BOLD}$X_DISPLAY${NC} through XWayland (the player finds its auth file at start)"
+        return
+    fi
+
     # Find XAUTHORITY from Xorg process command line
     local xorg_cmd
     xorg_cmd=$(ps aux | grep -i '[Xx]org' | head -1)
@@ -535,6 +556,7 @@ StandardError=journal
 # Display access
 Environment="DISPLAY=$X_DISPLAY"
 Environment="XDG_RUNTIME_DIR=/run/user/$DESKTOP_UID"
+Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$DESKTOP_UID/bus"
 $([ -n "$XAUTH_PATH" ] && echo "Environment=\"XAUTHORITY=$XAUTH_PATH\"")
 
 # Security
@@ -549,6 +571,30 @@ systemctl daemon-reload
 ok "Service file installed at $SYSTEMD_FILE"
 
 # ---------------------------------------------------------------------------
+# Automatic login (opt-in): an unattended screen must reach its desktop after a reboot
+# ---------------------------------------------------------------------------
+if [[ "$ARG_AUTOLOGIN" == "1" ]]; then
+    step "Enabling automatic login for $DESKTOP_USER"
+    if [[ -f /etc/gdm3/custom.conf ]] || [[ -d /etc/gdm3 ]]; then
+        GDM_CONF=/etc/gdm3/custom.conf
+        [[ -f "$GDM_CONF" ]] || printf '[daemon]\n' > "$GDM_CONF"
+        cp -n "$GDM_CONF" "$GDM_CONF.cmx-backup" 2>/dev/null || true
+        grep -q '^\[daemon\]' "$GDM_CONF" || printf '\n[daemon]\n' >> "$GDM_CONF"
+        sed -i '/^AutomaticLoginEnable *=/d; /^AutomaticLogin *=/d' "$GDM_CONF"
+        sed -i "/^\[daemon\]/a AutomaticLogin=$DESKTOP_USER" "$GDM_CONF"
+        sed -i "/^\[daemon\]/a AutomaticLoginEnable=true" "$GDM_CONF"
+        ok "GDM logs $DESKTOP_USER in automatically (backup: $GDM_CONF.cmx-backup)"
+    elif [[ -d /etc/lightdm ]]; then
+        mkdir -p /etc/lightdm/lightdm.conf.d
+        printf '[Seat:*]\nautologin-user=%s\nautologin-user-timeout=0\n' "$DESKTOP_USER" \
+            > /etc/lightdm/lightdm.conf.d/50-cmx-autologin.conf
+        ok "LightDM logs $DESKTOP_USER in automatically"
+    else
+        warn "No GDM or LightDM found — set up automatic login for $DESKTOP_USER manually"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Enable and start
 # ---------------------------------------------------------------------------
 step "Configuring firewall"
@@ -557,10 +603,12 @@ step "Configuring firewall"
 if command -v ufw &>/dev/null; then
     if ufw status | grep -q "Status: active"; then
         ufw allow 8081/tcp &>/dev/null && ok "ufw: opened port 8081 (player API)"
+        ufw allow 8083/tcp &>/dev/null && ok "ufw: opened port 8083 (control API, LAN triggers when enabled)"
     else
         # ufw is inactive — enable it and open required ports
         ufw allow ssh &>/dev/null        # keep SSH open!
         ufw allow 8081/tcp &>/dev/null
+        ufw allow 8083/tcp &>/dev/null
         ufw --force enable &>/dev/null
         ok "ufw: enabled and opened port 8081 (player API)"
     fi

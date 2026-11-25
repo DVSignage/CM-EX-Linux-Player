@@ -281,6 +281,14 @@ EOF
 
 If you need to register the player with a different CMS, or the player record was deleted:
 
+- **At the screen:** press **Ctrl+Alt+Shift+R**, then **Y** within 10 seconds.
+- **From this machine:**
+  `curl -X POST http://127.0.0.1:8083/api/reset-registration -H "X-Local-Key: $(cat ~/.config/signage-player/local-api.key)"`
+
+Either one clears the registration, cache and offline copy. A player whose
+`config.yaml` sets `cms_url` shows a new enrollment code; otherwise it returns
+to the setup screen. Or by hand:
+
 ```bash
 sudo rm /home/signage/.config/signage-player/state.json
 sudo systemctl restart signage-player
@@ -345,7 +353,7 @@ The player detects a 404 on the next heartbeat, clears its identity, and immedia
 
 The player follows the **DVSI Plus CMX player** (the native Windows port in
 `DVSignage/win-web-wrap`) for its CMS contract and behaviour. What is on screen
-is drawn by a **renderer page** the player serves itself (port 8083, loopback
+is drawn by a **renderer page** the player serves itself (port 8090, loopback
 only) and shows in a Chromium kiosk, so templates, walls and crossfades work
 offline. mpv plays the multicast wall stream, and is the whole display when
 Chromium is not installed (`playback.renderer: mpv` forces that).
@@ -377,6 +385,8 @@ cmx/
 ├── wall.py             # wall crop filters, multicast wall stream settings
 ├── screens.py          # PNG screens for the mpv fallback
 ├── browser.py          # a separate Chromium window (sites that refuse framing)
+├── lan_api.py          # control API on port 8083 (LAN sensors, controllers)
+├── ndi_out.py          # this screen as an NDI source
 ├── local_api.py        # local API on port 8081
 └── config.py           # config.yaml, paths, state.json
 ndi/engine.py           # optional NDI receive/send
@@ -453,8 +463,42 @@ Plus does: triggers (CMS command or touch), scenes with attractors and layouts,
 retrigger policies, `then` / back history, idle return and scheduled home
 scenes in the install's timezone.
 
+**Control API (port 8083).** The same local API as DVSI Plus, for sensors,
+touch panels and show controllers on the venue network. Wall routes:
+`POST /api/trigger` (`{"command":"trigger","id":3}` or `?id=3`), `/api/scene`
+(`{"scene":"…","stop":true}`), `/api/home`, `/api/back`, `/api/play-content`
+(`{"content_id":"…"}`), `/api/alignment` (`{"enabled":true}`), `/api/patch`
+(`{"element_id":"…","text":"…"}` or `"content_id"`) and `GET /api/interaction`;
+every answer is `{accepted, reason, scene}`. It listens on this machine only
+unless `lan_api.enabled` is true; set `lan_api.trigger_key` and LAN or browser
+callers must send it as `X-Trigger-Key`. Play/pause/restart, device and
+preview routes are for this machine only and need `X-Local-Key` (the key in
+`~/.config/signage-player/local-api.key`).
+
+```bash
+curl -X POST http://SCREEN-IP:8083/api/trigger -H 'X-Trigger-Key: …' -d '{"command":"trigger","id":3}'
+```
+
+**NDI output.** The screen can be published as an NDI source: switch it on
+locally (`ndi.output: true`) or from the CMS (`ndi_broadcast_active`, or the
+start/stop broadcast commands). As on DVSI Plus, a CMS "off" stops only a
+broadcast the CMS started, and the CMS's name applies while it is asking. On an
+X11 session the whole display is sent; on Wayland the renderer page itself
+(Chromium screencast). Needs `pip install -r requirements-ndi.txt`; expect
+noticeable CPU at 1080p 30 fps on small boards — lower `ndi.fps` there.
+
+**Ubuntu desktop / Wayland.** The player stays on X11 through XWayland and finds
+the session's auth file itself at every start, so stock Ubuntu (GNOME on
+Wayland, snap Chromium) works. Install with `--autologin` so the screen reaches
+its desktop unattended after a reboot:
+`sudo bash install.sh --cms https://cms.example --autologin`.
+
 **Live capture.** `show_capture` shows a USB/UVC camera or HDMI grabber full
 screen (template capture elements too), through the browser's camera access.
+An A/V offset (`av_offset_ms`, ±500 ms, on the command or the capture element)
+lines picture and sound up: positive holds the picture back, negative delays
+the sound. A new offset for the device already on screen applies without
+reopening it; the heartbeat reports `av_offset_ms` and `av_hold_ms`.
 DeckLink is not supported on Linux.
 
 **Edge mode.** Control requests and downloads go to the edge server first and
@@ -465,7 +509,12 @@ and player health go to the edge as telemetry.
 **Telemetry.** Boot and crash events, renderer crashes (Chromium is relaunched
 automatically), wall events, edge failover, proof of play and health (edge
 mode), and a machine inventory (OS, remote-access tools, installed apps) daily
-or on change.
+or on change. If the CMS refuses an inventory for good, it is sent once a day
+until the player version changes. A port the player needs (8081, 8083, 8090)
+that another program holds shows in the heartbeat's `error` line ("port
+conflict: control API tcp port 8083 is held by nginx"), is reported as a
+`port_conflict` event, and is retried every 30 s (`port_conflict_cleared` once
+it binds).
 
 **Preview.** When the CMS heartbeat says `preview_watch`, the player pushes
 JPEG frames to `/players/{id}/preview-frame` (640×360 every 2 s, or 960×540

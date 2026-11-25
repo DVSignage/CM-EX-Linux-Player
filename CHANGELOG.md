@@ -2,6 +2,79 @@
 
 All notable changes to the CM:EX Linux Player.
 
+## [2.4.0] - 2026-11-24
+
+### Added
+- A/V offset for live capture (`av_offset_ms` and its DVSI aliases, ±500 ms):
+  positive holds the picture back, negative delays the sound through Web
+  Audio. A changed offset for the device on screen applies live, without
+  reopening it; the heartbeat reports `av_offset_ms` / `av_hold_ms`.
+- Port-conflict reporting: a port the player cannot bind (local API 8081,
+  control API 8083, renderer 8090) names the program holding it in the
+  heartbeat `error`, sends `port_conflict` / `port_conflict_cleared` edge
+  events, and is retried every 30 s.
+- Reset registration: Ctrl+Alt+Shift+R then Y at the screen, or
+  `POST /api/reset-registration` (this machine, `X-Local-Key`). Clears the
+  identity, cache and offline copy; back to the setup screen or a new code.
+
+### Changed
+- An inventory the CMS refuses for good is sent only once a day until the
+  player version changes.
+
+## [2.3.0] - 2026-11-24
+
+### Added
+- NDI output that actually sends the screen: frames from an X grab (X11) or
+  a Chromium screencast (Wayland), re-sent at a steady `ndi.fps`. Switched on
+  by `ndi.output` or by the CMS (`ndi_broadcast_active` / `ndi_broadcast_name`
+  on the heartbeat, start/stop_ndi_broadcast), with DVSI Plus's rule: a CMS
+  "off" stops only a broadcast the CMS started.
+
+### Fixed
+- `start_ndi_broadcast` created an NDI sender that never received a frame.
+
+## [2.2.0] - 2026-11-24
+
+### Added
+- Control API on port 8083, as on DVSI Plus: interactive-wall routes for LAN
+  sensors, touch panels and show controllers (`/api/trigger`, `/api/scene`,
+  `/api/home`, `/api/back`, `/api/play-content`, `/api/alignment`,
+  `/api/patch`, `GET /api/interaction`), and key-protected play / pause /
+  restart, device, preview, capture and NDI routes for this machine. Loopback
+  unless `lan_api.enabled`; `lan_api.trigger_key` protects the LAN routes.
+  Access rules ported from DVSI Plus LocalApiPolicy, case for case.
+
+### Changed
+- The renderer page moved from port 8083 to 8090 (loopback) to free 8083.
+- `install.sh` opens port 8083 in ufw.
+
+## [2.1.1] - 2026-11-24
+
+Checked against the real CM:EX server: 16 real template definitions, the
+interactive walls they carry, the CMS's own render page, and the inventory a
+2.1.0 player already reported.
+
+### Added
+- Native `web` elements (embedded pages) in templates, and the template
+  background image (`background_image_id`).
+- Ubuntu desktop / Wayland: the player waits for the desktop session, finds
+  the XWayland auth file at every start (its name changes at each login),
+  keeps Chromium on X11, and keeps GNOME from blanking, locking or showing
+  notification banners. `install.sh --autologin` logs the desktop user in at
+  boot (GDM / LightDM).
+- Preview frames taken from Chromium itself (DevTools, loopback only), so
+  previews work where an X screen grab is black (XWayland).
+- Remote-access inventory: service state (running / stopped / absent),
+  package versions, CM:EX tool ids (realvnc, wayvnc, x11vnc, tigervnc...).
+- Real template definitions (scrubbed) as test fixtures.
+
+### Fixed
+- Template rendering matched to the CMS render page: canvas colour from
+  `background_color`, text `verticalAlign` and padding, a "No image"
+  placeholder, RSS `speedPxS`, `separator`, `backgroundOpacity`, `showImages`
+  and the CMS's row and ticker styling.
+- SSH key-only logins were reported with an auth value the CMS does not know.
+
 ## [2.1.0] - 2026-11-23
 
 The rest of the DVSI Plus CMX player's feature set. What is on screen is now

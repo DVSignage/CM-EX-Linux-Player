@@ -26,7 +26,7 @@ from .wallhost import canonical_keys
 
 log = logging.getLogger("player")
 
-KNOWN_TYPES = {"text", "panel", "image", "video", "capture", "rss", "trigger_zone", "template"}
+KNOWN_TYPES = {"text", "panel", "image", "video", "capture", "rss", "trigger_zone", "template", "web"}
 PATCHABLE = {"image", "video", "text", "capture", "rss"}
 MEDIA_KEYS = ("contentId", "content_id", "contentID", "mediaId", "media_id", "assetId", "asset_id")
 DEVICE_KEYS = ("deviceLabel", "device_label", "deviceId", "device_id", "label", "capture_device_label")
@@ -61,6 +61,23 @@ def capture_audio(props: dict) -> bool:
     if isinstance(props.get("muted"), bool):
         return not props["muted"]
     return True
+
+
+AV_KEYS = ("av_offset_ms", "av_sync_ms", "avOffsetMs", "audio_delay_ms", "avSyncMs")
+MAX_AV_TRIM = 500
+
+
+def av_offset(props: dict) -> int:
+    """The A/V trim in ms (+ holds the picture, - delays the sound), ±500."""
+    for k in AV_KEYS:
+        v = props.get(k)
+        if v is None or isinstance(v, bool):
+            continue
+        try:
+            return max(-MAX_AV_TRIM, min(MAX_AV_TRIM, int(round(float(v)))))
+        except (TypeError, ValueError):
+            continue
+    return 0
 
 
 def zone_trigger_id(props: dict) -> Optional[int]:
@@ -165,6 +182,9 @@ class TemplateBuilder:
             elif etype == "capture":
                 el["device"] = device_label(props)
                 el["audio"] = capture_audio(props)
+                el["av_offset"] = av_offset(props)
+            elif etype == "web":
+                el["src"] = str(props.get("src") or props.get("url") or "")
             elif etype == "template":
                 el["nested"] = await self._nested(props, depth, chain)
             if etype in ("text", "image", "video", "panel"):
@@ -172,10 +192,14 @@ class TemplateBuilder:
                 if tap is not None:
                     el["tap_trigger"] = tap
             out.append(el)
+        # The canvas background, as the CMS render draws it: background_color
+        # (black when empty) under background_image_id, cover / centred.
+        bg_image = await self._media_for(definition.get("background_image_id"), "image")
         return {
             "width": int(_num(definition.get("width"), 1920)) or 1920,
             "height": int(_num(definition.get("height"), 1080)) or 1080,
             "background": definition.get("background_color"),
+            "background_image": bg_image,
             "timezone": definition.get("timezone"),
             "elements": out,
         }

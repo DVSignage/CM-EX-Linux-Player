@@ -6,4 +6,4 @@ Feature parity target: the DVSI Plus native CMX player (C#, win-web-wrap
 `WinWebviewWrap/Cmx/`). See README.md for the architecture.
 """
 
-VERSION = "2.1.0"
+VERSION = "2.4.0"
