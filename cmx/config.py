@@ -101,6 +101,7 @@ class Settings:
     renderer: str = "auto"          # "auto": Chromium page when installed; "mpv": mpv only
     loading_indicator: bool = False
     music_wave: bool = True
+    capture_max_height: int = 720   # live capture: camera lines at most (CPU-decoded; 1080 for full-screen HDMI capture)
     connection_mode: str = ""       # "cloud" | "edge"; empty = from state (setup screen) or cloud
     edge_url: str = ""
     lan_triggers: bool = False      # the control API on 8083 listens on the LAN, not only loopback
@@ -140,6 +141,7 @@ class Settings:
             renderer=str(pb.get("renderer") or "auto").lower(),
             loading_indicator=flag(pb.get("loading_indicator"), False),
             music_wave=flag(pb.get("music_wave"), True),
+            capture_max_height=min(2160, max(240, _int_or(pb.get("capture_max_height"), 720))),
             connection_mode=str(cfg.get("connection_mode") or "").lower(),
             edge_url=str(cfg.get("edge_url") or "").strip().rstrip("/"),
             lan_triggers=flag(lan.get("enabled"), False),

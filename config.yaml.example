@@ -33,6 +33,11 @@ playback:
   loading_indicator: false
   # The animated wave behind the audio Now Playing card
   music_wave: true
+  # Live capture (cameras / HDMI capture): ask the device for at most this many
+  # lines; smaller tiles ask for their own size. Frames are decoded by the CPU, so
+  # 1080 on a Raspberry Pi can overheat it; raise it for full-screen HDMI capture
+  # on a stronger machine.
+  capture_max_height: 720
 
 # Control API on port 8083 (optional): lets sensors, touch panels and show
 # controllers on the LAN drive interactive walls (/api/trigger, /api/scene...).
