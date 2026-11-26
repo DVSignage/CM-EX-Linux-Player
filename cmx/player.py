@@ -343,6 +343,8 @@ class Player:
 
         if self.renderer is not None:
             self._bound("renderer page", self.renderer.port, self.renderer.start())
+            if self.kiosk is not None:
+                self.kiosk.url = self.renderer.url   # the port may have moved off a taken 8090
             self.surface.send({"type": "config", "loading_indicator": self.settings.loading_indicator,
                                "music_wave": self.settings.music_wave})
             if self.kiosk is not None:

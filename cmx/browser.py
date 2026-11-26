@@ -13,11 +13,19 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-__all__ = ["Browser", "find_chromium", "profile_dir_for", "root_flags", "FLAGS"]
+__all__ = ["Browser", "find_chromium", "profile_dir_for", "root_flags", "FLAGS", "DISABLED_FEATURES"]
 
 log = logging.getLogger("player")
 
 CANDIDATES = ("chromium-browser", "chromium", "google-chrome-stable", "google-chrome")
+# Chromium keeps only the LAST --disable-features it is given, so every window's
+# list is built from this one.
+#   WebRtcPipeWireCamera: on desktops with a camera portal (Raspberry Pi OS, GNOME)
+#   Chromium asks for the camera through xdg-desktop-portal, which puts an
+#   "Allow app to use the camera?" dialog over the content that nobody at an
+#   unattended screen can answer. Without it Chromium opens /dev/video* directly,
+#   and --use-fake-ui-for-media-stream (kiosk) grants the page's own request.
+DISABLED_FEATURES = ["TranslateUI", "WebRtcPipeWireCamera"]
 
 FLAGS = [
     "--kiosk",
@@ -25,7 +33,7 @@ FLAGS = [
     "--disable-infobars",
     "--no-first-run",
     "--disable-translate",
-    "--disable-features=TranslateUI",
+    "--disable-features=" + ",".join(DISABLED_FEATURES),
     "--disable-notifications",
     "--no-default-browser-check",
     "--disable-session-crashed-bubble",

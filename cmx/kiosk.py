@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from .browser import FLAGS, find_chromium, profile_dir_for, root_flags
+from .browser import DISABLED_FEATURES, FLAGS, find_chromium, profile_dir_for, root_flags
 from .cdp import PORT as CDP_PORT
 
 log = logging.getLogger("player")
@@ -23,7 +23,7 @@ KIOSK_FLAGS = FLAGS + [
     "--overscroll-history-navigation=0",
     "--disable-pinch",
     "--password-store=basic",                # no keyring prompt on a signage box
-    "--disable-features=TranslateUI,MediaRouter",
+    "--disable-features=" + ",".join(DISABLED_FEATURES + ["MediaRouter"]),   # the last one counts
 ]
 BACKOFF = [1, 2, 5, 10, 30]
 HANG_SECONDS = 25.0          # no "alive" from the page for this long = hung
