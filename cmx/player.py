@@ -346,7 +346,8 @@ class Player:
             if self.kiosk is not None:
                 self.kiosk.url = self.renderer.url   # the port may have moved off a taken 8090
             self.surface.send({"type": "config", "loading_indicator": self.settings.loading_indicator,
-                               "music_wave": self.settings.music_wave})
+                               "music_wave": self.settings.music_wave,
+                               "capture_max_height": self.settings.capture_max_height})
             if self.kiosk is not None:
                 self.kiosk.start()
         elif self.mpv is not None and hasattr(self.mpv, "initialise"):

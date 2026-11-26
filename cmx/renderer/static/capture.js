@@ -28,6 +28,21 @@ CMX.capture = (() => {
     return devs[0] || null;
   }
 
+  // Ask the camera for what the picture covers on screen, at most capture_max_height
+  // lines (720 by default, config.yaml): every frame of a USB camera is decoded and
+  // drawn by the CPU, and a Raspberry Pi 4 reached 85 °C and throttled decoding 1080p
+  // for a template tile. A camera answers with its nearest mode (a C920 gives
+  // 800×448 for an 800×450 tile).
+  function wantedSize(video) {
+    const maxH = Math.max(240, +(CMX.state.config.capture_max_height) || 720);
+    const maxW = Math.round(maxH * 16 / 9);
+    const r = video.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+    let w = Math.round(r.width * dpr), h = Math.round(r.height * dpr);
+    if (!(w > 0 && h > 0)) { w = maxW; h = maxH; }      // not laid out yet: the cap itself
+    const k = Math.min(1, maxW / w, maxH / h);
+    return { width: Math.max(320, Math.round(w * k)), height: Math.max(180, Math.round(h * k)) };
+  }
+
   function clampTrim(ms) { ms = +ms || 0; return Math.max(-MAX_TRIM, Math.min(MAX_TRIM, Math.round(ms))); }
 
   // One consumer of a camera: keeps it open, shows "waiting / lost" in its
@@ -118,8 +133,9 @@ CMX.capture = (() => {
       try {
         const dev = await pickDevice(label, id);
         if (!dev) throw new Error("no capture device");
+        const size = wantedSize(video);
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { deviceId: { exact: dev.deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+          video: { deviceId: { exact: dev.deviceId }, width: { ideal: size.width }, height: { ideal: size.height } },
           audio: audio ? true : false,
         });
         if (stopped) { stream.getTracks().forEach((t) => t.stop()); return; }

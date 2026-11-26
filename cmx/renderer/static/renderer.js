@@ -17,7 +17,7 @@ const CMX = (() => {
     kind: null,           // "video" | "image" | "audio" | "web" | "template" | "capture" | "screen"
     volume: 100,
     muted: false,
-    config: { loading_indicator: false, music_wave: true },
+    config: { loading_indicator: false, music_wave: true, capture_max_height: 720 },
     fadeMs: 400,
   };
   const $ = (id) => document.getElementById(id);
