@@ -2,6 +2,27 @@
 
 All notable changes to the CM:EX Linux Player.
 
+## [2.5.0] - 2026-11-26
+
+### Added
+- NDI sources inside templates: the CMS's `ndi` element (`props.sourceName`)
+  is drawn natively instead of sending the whole template to the web render.
+  One receiver per source, shared by every element that shows it, scaled to
+  the element and capped at 25 fps; "Waiting for NDI source" until the sender
+  appears (it keeps looking, as DVSI Plus does), "No signal" when frames stop;
+  stopped 3 s after the last element showing it leaves. Video only.
+
+### Fixed
+- Raspberry Pi OS: the service starts at boot (no ordering cycle with
+  graphical.target), finds the right display and Xauthority, and sees the X
+  socket; the renderer page moves to the next free port up to 8099 when 8090
+  is taken; no camera permission dialog over the content.
+- Live capture asks the camera for the size it is drawn at (at most
+  `playback.capture_max_height`, 720 by default) instead of 1080p, which
+  overloaded a Raspberry Pi 4.
+- The renderer's port fallback also applies when Windows reports a held port
+  as "access denied" (test runs on Windows).
+
 ## [2.4.0] - 2026-11-24
 
 ### Added
