@@ -13,6 +13,16 @@ All notable changes to the CM:EX Linux Player.
   service's `NoNewPrivileges=true` stops the setuid snap-confine, so the kiosk
   exited with code 1 at every launch. `install.sh` leaves it off when
   Chromium is a snap.
+- `install.sh` could also stop silently on a desktop without Xorg when no
+  `--user` was given, on X11 without `xdpyinfo`/`xset`, or before any display
+  server was up: lookups that find nothing, or a display check that answers
+  "no", no longer end the install.
+- `offline-install.sh` caught up with `install.sh`: the same detection fixes
+  and snap check, the display read from the Xorg arguments (not `ps aux`,
+  whose start time 10:37 became `DISPLAY=:37`) with an Xauthority the desktop
+  user can open, and the service unit that starts at boot (`WantedBy=
+  graphical.target`, no ordering cycle) and can see the X sockets
+  (`BindPaths=-/tmp/.X11-unix`).
 
 ## [2.4.0] - 2026-11-24
 

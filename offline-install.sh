@@ -77,9 +77,12 @@ DESKTOP_USER=""
 DESKTOP_UID=""
 XAUTH_PATH=""
 X_DISPLAY=":0"
+WAYLAND_SESSION=0
 
 step "Detecting desktop user"
 
+# Kept in step with install.sh (detect_desktop_user, detect_display,
+# chromium_is_snap and the service unit); tests/test_install_script.py runs both.
 detect_desktop_user() {
     if [[ -n "$ARG_USER" ]]; then
         DESKTOP_USER="$ARG_USER"
@@ -89,10 +92,13 @@ detect_desktop_user() {
         return
     fi
 
-    # Method 1: Who owns the Xorg process
+    # Method 1: Who owns the Xorg process. A Wayland desktop has none: the grep
+    # finds nothing, which must not end the install (pipefail).
     local xorg_user
-    xorg_user=$(ps -eo user,comm 2>/dev/null | grep -i '[Xx]org' | head -1 | awk '{print $1}')
-    [[ -n "$xorg_user" && "$xorg_user" != "root" ]] && DESKTOP_USER="$xorg_user"
+    xorg_user=$(ps -eo user,comm 2>/dev/null | grep -i '[Xx]org' | head -1 | awk '{print $1}' || true)
+    if [[ -n "$xorg_user" && "$xorg_user" != "root" ]]; then
+        DESKTOP_USER="$xorg_user"
+    fi
 
     # Method 2: loginctl graphical session
     if [[ -z "$DESKTOP_USER" ]] && command -v loginctl &>/dev/null; then
@@ -109,7 +115,7 @@ detect_desktop_user() {
     # Method 3: tty owner
     if [[ -z "$DESKTOP_USER" ]]; then
         local tty_user
-        tty_user=$(who 2>/dev/null | grep -E 'tty[12]' | head -1 | awk '{print $1}')
+        tty_user=$(who 2>/dev/null | grep -E 'tty[12]' | head -1 | awk '{print $1}' || true)
         [[ -n "${tty_user:-}" ]] && DESKTOP_USER="$tty_user"
     fi
 
@@ -133,37 +139,81 @@ detect_desktop_user
 step "Detecting display"
 
 detect_display() {
-    local xorg_cmd
-    xorg_cmd=$(ps aux 2>/dev/null | grep -i '[Xx]org' | head -1)
-
-    if echo "$xorg_cmd" | grep -q '\-auth'; then
-        XAUTH_PATH=$(echo "$xorg_cmd" | sed 's/.*-auth \([^ ]*\).*/\1/')
-    fi
-
-    if [[ -z "${XAUTH_PATH:-}" || ! -f "${XAUTH_PATH:-}" ]]; then
-        for candidate in \
-            "/run/user/$DESKTOP_UID/gdm/Xauthority" \
-            "/home/$DESKTOP_USER/.Xauthority" \
-            "/run/user/$DESKTOP_UID/.Xauthority"; do
-            if [[ -f "$candidate" ]]; then
-                XAUTH_PATH="$candidate"; break
-            fi
-        done
-    fi
-
-    if echo "$xorg_cmd" | grep -qE ':[0-9]+'; then
-        X_DISPLAY=$(echo "$xorg_cmd" | grep -oE ':[0-9]+' | head -1)
-    fi
-
-    if [[ -n "${XAUTH_PATH:-}" ]] && DISPLAY="$X_DISPLAY" XAUTHORITY="$XAUTH_PATH" xdpyinfo &>/dev/null; then
-        ok "Display: ${BOLD}$X_DISPLAY${NC}  Xauthority: ${BOLD}$XAUTH_PATH${NC}"
-    elif su - "$DESKTOP_USER" -c "DISPLAY=$X_DISPLAY xdpyinfo" &>/dev/null 2>&1; then
-        ok "Display: ${BOLD}$X_DISPLAY${NC}  (no explicit Xauthority needed)"
+    # GNOME/KDE on Wayland: the player uses XWayland, whose auth file
+    # (/run/user/<uid>/.mutter-Xwaylandauth.*) gets a new random name at every
+    # login — so it is NOT written into the service; the player finds the live
+    # one when it starts (cmx/display.py).
+    # GNOME 46+ starts Xwayland on demand: until an X11 app opens there is no
+    # Xwayland process, and an unguarded grep that finds nothing ends the whole
+    # install here (set -e + pipefail). The display then stays :0, where mutter
+    # listens and starts Xwayland for the player's first window.
+    if pgrep -x Xwayland &>/dev/null || ls /run/user/"$DESKTOP_UID"/wayland-* &>/dev/null; then
+        WAYLAND_SESSION=1
+        local xw_cmd
+        xw_cmd=$(ps -eo args= | grep '[X]wayland' | head -1 || true)
+        if echo "$xw_cmd" | grep -qE ' :[0-9]+'; then
+            X_DISPLAY=$(echo "$xw_cmd" | grep -oE ' :[0-9]+' | head -1 | tr -d ' ')
+        fi
         XAUTH_PATH=""
-    else
-        warn "Could not verify display. Service may need manual configuration."
-        warn "Edit: sudo nano /etc/systemd/system/signage-player.service"
+        ok "Wayland session — display ${BOLD}$X_DISPLAY${NC} through XWayland (the player finds its auth file at start)"
+        return
     fi
+
+    # X11. Read the Xorg arguments ONLY: `ps aux` also prints the start time
+    # (10:37), which a ':[0-9]+' match took for the display (DISPLAY=:37).
+    # No Xorg yet (installed before the desktop is up): keep :0 and carry on.
+    local xorg_cmd
+    xorg_cmd=$(ps -eo args= | grep -E '^[^ ]*[Xx]org( |$)' | head -1 || true)
+    local d
+    d=$(echo "$xorg_cmd" | grep -oE '(^| ):[0-9]+( |$)' | head -1 | tr -d ' ' || true)
+    [[ -n "$d" ]] && X_DISPLAY="$d"
+
+    # An Xauthority the PLAYER can use: the service runs as $DESKTOP_USER, so the
+    # X server's own -auth file (lightdm's /var/run/lightdm/root/:0 is root-only)
+    # only counts if that user can read it; the user's own file usually works.
+    local home_dir
+    home_dir=$(getent passwd "$DESKTOP_USER" | cut -d: -f6)
+    local candidates=()
+    if echo "$xorg_cmd" | grep -q -- ' -auth '; then
+        candidates+=("$(echo "$xorg_cmd" | sed 's/.* -auth \([^ ]*\).*/\1/')")
+    fi
+    candidates+=("/run/user/$DESKTOP_UID/gdm/Xauthority" "${home_dir:-/home/$DESKTOP_USER}/.Xauthority"
+                 "/run/user/$DESKTOP_UID/.Xauthority")
+
+    # Checked AS the desktop user, the way the service will open the display.
+    as_user_can_open() {  # $1 = Xauthority path, or "" for none
+        local probe=""
+        if command -v xdpyinfo &>/dev/null; then probe="xdpyinfo"
+        elif command -v xset &>/dev/null; then probe="xset q"
+        else return 2; fi
+        runuser -u "$DESKTOP_USER" -- env DISPLAY="$X_DISPLAY" ${1:+XAUTHORITY="$1"} $probe &>/dev/null
+    }
+
+    XAUTH_PATH=""
+    local c rc
+    for c in "${candidates[@]}"; do
+        [[ -n "$c" && -f "$c" ]] || continue
+        runuser -u "$DESKTOP_USER" -- test -r "$c" || continue
+        rc=0; as_user_can_open "$c" || rc=$?   # 1 / 2 are answers, not errors (set -e)
+        if [[ $rc -eq 0 ]]; then
+            XAUTH_PATH="$c"
+            ok "Display: ${BOLD}$X_DISPLAY${NC}  Xauthority: ${BOLD}$XAUTH_PATH${NC}"
+            return
+        elif [[ $rc -eq 2 ]]; then   # nothing to test with: take the first readable file
+            XAUTH_PATH="$c"
+            ok "Display: ${BOLD}$X_DISPLAY${NC}  Xauthority: ${BOLD}$XAUTH_PATH${NC} (not verified: no xdpyinfo/xset)"
+            return
+        fi
+    done
+
+    # Some setups need no Xauthority at all
+    if as_user_can_open ""; then
+        ok "Display: ${BOLD}$X_DISPLAY${NC}  (no explicit Xauthority needed)"
+        return
+    fi
+
+    warn "Could not verify display access for $DESKTOP_USER on $X_DISPLAY. The service may need manual configuration."
+    warn "See: sudo nano /etc/systemd/system/signage-player.service"
 }
 
 detect_display
@@ -343,10 +393,26 @@ SYSTEMD_FILE="/etc/systemd/system/signage-player.service"
 XAUTH_ENV_LINE=""
 [[ -n "$XAUTH_PATH" ]] && XAUTH_ENV_LINE="Environment=\"XAUTHORITY=$XAUTH_PATH\""
 
+# Ubuntu's Chromium is a snap, started through snap-confine, which is setuid
+# root: under NoNewPrivileges=true it refuses to run ("snap-confine is packaged
+# without necessary permissions") and the kiosk exits with code 1 at every launch.
+chromium_is_snap() {
+    command -v snap &>/dev/null && snap list chromium &>/dev/null
+}
+
+NO_NEW_PRIVILEGES=true
+if chromium_is_snap; then
+    NO_NEW_PRIVILEGES=false
+    info "Chromium is a snap — the service runs without NoNewPrivileges so snap-confine can start it"
+fi
+
 cat > "$SYSTEMD_FILE" <<SERVICEEOF
 [Unit]
 Description=Digital Signage Player Daemon
-After=network-online.target graphical.target
+# Started with the desktop (graphical.target, below), after the display manager.
+# NOT After=graphical.target: graphical.target waits for the units it wants, so
+# that is an ordering cycle and systemd drops the player's start at every boot.
+After=network-online.target display-manager.service
 Wants=network-online.target
 
 [Service]
@@ -356,19 +422,26 @@ Group=$DESKTOP_USER
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$VENV_DIR/bin/python3 $INSTALL_DIR/main.py
 Restart=always
+# restart_service from the CMS exits the process; systemd brings it back
 RestartSec=3
 StandardOutput=journal
 StandardError=journal
 
+# Display access
 Environment="DISPLAY=$X_DISPLAY"
 Environment="XDG_RUNTIME_DIR=/run/user/$DESKTOP_UID"
+Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$DESKTOP_UID/bus"
 $XAUTH_ENV_LINE
 
-NoNewPrivileges=true
+# Security (no NoNewPrivileges for a snap Chromium: see chromium_is_snap above)
+NoNewPrivileges=$NO_NEW_PRIVILEGES
 PrivateTmp=true
+# ...but the X server's sockets live in /tmp/.X11-unix: share that one folder, or
+# the player sees no display and waits for a desktop session that never comes.
+BindPaths=-/tmp/.X11-unix
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
 SERVICEEOF
 
 systemctl daemon-reload
@@ -388,7 +461,7 @@ fi
 # ---------------------------------------------------------------------------
 step "Starting signage-player service"
 
-systemctl enable signage-player
+systemctl reenable signage-player   # reenable: moves an older multi-user.target link to graphical.target
 systemctl restart signage-player
 ok "signage-player enabled and started"
 
