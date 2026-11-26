@@ -454,8 +454,8 @@ template merges in place. A single-item playlist loops in place.
 `clip_start`/`clip_end` trim videos. Audio-only items show a Now Playing card.
 
 **Templates** are drawn natively: text, panels, pictures, clips, RSS (ticker or
-list, from a cached feed), live capture, trigger zones and nested templates
-(three levels). Every file a template can show is downloaded before it goes on
+list, from a cached feed), live capture, NDI sources, embedded web pages,
+trigger zones and nested templates (three levels). Every file a template can show is downloaded before it goes on
 screen. `template_patch` changes one element live.
 
 **Interactive walls** follow the template's `interaction` spec exactly as DVSI
@@ -486,6 +486,15 @@ broadcast the CMS started, and the CMS's name applies while it is asking. On an
 X11 session the whole display is sent; on Wayland the renderer page itself
 (Chromium screencast). Needs `pip install -r requirements-ndi.txt`; expect
 noticeable CPU at 1080p 30 fps on small boards — lower `ndi.fps` there.
+
+**NDI in templates.** A template's NDI element (`props.sourceName`, e.g.
+`STUDIO (Camera 1)`; a part of the name is enough) shows that source live. The
+player receives it and hands the page a picture stream scaled to the element,
+so one receiver serves every element showing the same source. Until the sender
+is on the network the element shows "Waiting for NDI source", and "No signal"
+when frames stop; it connects by itself when the sender appears. The receiver
+stops a few seconds after the template leaves the screen. Pictures only: the
+source's sound is not played. Needs the same `requirements-ndi.txt`.
 
 **Ubuntu desktop / Wayland.** The player stays on X11 through XWayland and finds
 the session's auth file itself at every start, so stock Ubuntu (GNOME on

@@ -114,6 +114,39 @@ CMX.template = (() => {
     return node;
   }
 
+  // An NDI source (props.sourceName) as an MJPEG stream from the renderer server, sized to what
+  // is drawn. The server shows a "waiting" picture until the sender is found; a dropped stream
+  // (player restart) is reopened while the element is still on screen.
+  function buildNdi(e) {
+    const node = document.createElement("div");
+    node.className = "el ndi";
+    node.style.background = "#000";
+    if (!e.source) {
+      const hint = document.createElement("div");
+      hint.className = "hint on";
+      hint.textContent = "NDI element names no source";
+      node.appendChild(hint);
+      return node;
+    }
+    const img = document.createElement("img");
+    img.dataset.ndi = e.source;
+    img.alt = "";
+    Object.assign(img.style, { width: "100%", height: "100%", display: "block",
+      objectFit: FIT[(e.props.objectFit || "contain").toLowerCase()] || "contain" });
+    const px = (v) => Math.max(64, Math.round(v * ((cur && cur.scale) || 1) * (window.devicePixelRatio || 1)));
+    const url = () => `/ndi/stream?source=${encodeURIComponent(e.source)}&w=${px(e.width)}&h=${px(e.height)}&r=${Date.now()}`;
+    img.addEventListener("error", () => { setTimeout(() => { if (img.isConnected && img.dataset.ndi) img.src = url(); }, 2000); });
+    img.src = url();
+    node.appendChild(img);
+    return node;
+  }
+
+  // Close the NDI streams under a node that leaves the screen, so the player's receiver is released
+  // now rather than whenever the image is collected.
+  function closeNdi(node) {
+    for (const img of node.querySelectorAll("img[data-ndi]")) { delete img.dataset.ndi; img.removeAttribute("src"); }
+  }
+
   function buildNested(payload, e) {
     const node = document.createElement("div");
     node.className = "el nested";
@@ -144,6 +177,7 @@ CMX.template = (() => {
       case "panel": node = buildPanel(e); break;
       case "image": case "video": node = buildMedia(payload, e); break;
       case "capture": node = buildCapture(e); break;
+      case "ndi": node = buildNdi(e); break;
       case "rss": node = buildRss(e); break;
       case "trigger_zone": node = nested ? document.createElement("div") : CMX.wall.buildZone(payload, e); break;
       case "template": node = buildNested(payload, e); break;
@@ -272,6 +306,7 @@ CMX.template = (() => {
     for (const v of cur.videos) { try { v.pause(); v.removeAttribute("src"); v.load(); } catch (e) {} }
     for (const stop of cur.rss) stop();
     for (const c of cur.captures) c.stop();
+    closeNdi(root);
     root.innerHTML = "";
     cur = null;
   }
@@ -307,6 +342,7 @@ CMX.template = (() => {
       node.style.opacity = "1";
       if (old) setTimeout(() => {
         for (const ov of old.node.querySelectorAll("video")) { ov.pause(); cur && cur.videos.delete(ov); }
+        closeNdi(old.node);
         old.node.remove();
       }, 450);
     };
@@ -334,7 +370,7 @@ CMX.template = (() => {
       if (oldDefs.get(e.id) !== JSON.stringify(e)) swap(e.id, e, m);
     }
     for (const [id, rec] of cur.els) {
-      if (!keep.has(id)) { rec.node.style.transition = "opacity 400ms ease"; rec.node.style.opacity = "0"; setTimeout(() => rec.node.remove(), 450); cur.els.delete(id); }
+      if (!keep.has(id)) { rec.node.style.transition = "opacity 400ms ease"; rec.node.style.opacity = "0"; setTimeout(() => { closeNdi(rec.node); rec.node.remove(); }, 450); cur.els.delete(id); }
     }
     CMX.state.gen = m.gen;
   }

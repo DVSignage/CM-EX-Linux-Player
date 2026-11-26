@@ -9,6 +9,8 @@ program already holds 8090 the next free port up to 8099 is used, see FALLBACK_P
   /events            a Server-Sent Events stream: what the page should show
   /api/event   POST  what the page reports back (ended, status, taps, ...)
   /api/rss/<cid>     the cached headlines of a feed
+  /ndi/stream        ?source=&w=&h= an NDI source as MJPEG, for a template's
+                     `ndi` element (see cmx/ndi_in.py)
 
 The player side talks to it through `send()` (to every page) and an event
 callback that is handed to the asyncio loop thread-safely. The last "show"
@@ -26,7 +28,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 
 log = logging.getLogger("player")
 
@@ -63,6 +65,8 @@ class RendererServer:
         self._last_show: Optional[dict] = None
         self._last_extra: Dict[str, dict] = {}
         self._server: Optional[ThreadingHTTPServer] = None
+        self.ndi_feeds = None          # cmx.ndi_in.NdiFeeds, when the player has one
+        self._stopping = threading.Event()
 
     @property
     def url(self) -> str:
@@ -105,6 +109,7 @@ class RendererServer:
 
     def start(self) -> Optional[str]:
         srv = self
+        self._stopping.clear()
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -149,6 +154,8 @@ class RendererServer:
                         return self._json({"items": []})
                 if path == "/events":
                     return self._events()
+                if path == "/ndi/stream":
+                    return self._ndi_stream()
                 return self._json({"error": "not found"}, 404)
 
             def do_POST(self):
@@ -220,6 +227,39 @@ class RendererServer:
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
+            def _ndi_stream(self):
+                from .. import ndi_in
+                q = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+                name = (q.get("source") or [""])[0].strip()
+
+                def size(k):
+                    try:
+                        return max(0, min(4096, int(float((q.get(k) or ["0"])[0]))))
+                    except ValueError:
+                        return 0
+                feeds = srv.ndi_feeds
+                if not name or feeds is None or not feeds.available:
+                    why = "no source named" if not name else "NDI is not installed on this player"
+                    return self._send(200, ndi_in.placeholder_jpeg("NDI unavailable", why), "image/jpeg")
+                feed = feeds.acquire(name)
+                if feed is None:
+                    return self._send(503, ndi_in.placeholder_jpeg("NDI unavailable", name), "image/jpeg")
+                self.close_connection = True
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=ndiframe")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    for jpg in feeds.frames(feed, size("w"), size("h"), srv._stopping):
+                        self.wfile.write(b"--ndiframe\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                         + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    feeds.release(feed)
+
             def _events(self):
                 q: queue.Queue = queue.Queue(maxsize=500)
                 self.send_response(200)
@@ -263,7 +303,8 @@ class RendererServer:
                 break
             except OSError as e:
                 error = e
-                if e.errno != errno.EADDRINUSE:
+                # Windows reports a port another socket holds exclusively as EACCES (10013)
+                if e.errno not in (errno.EADDRINUSE, errno.EACCES):
                     break
         if self._server is None:
             log.error(f"[RENDERER] cannot listen on {self.host}:{wanted}: {error}")
@@ -276,6 +317,7 @@ class RendererServer:
         return None
 
     def stop(self) -> None:
+        self._stopping.set()
         if self._server:
             self._server.shutdown()
             self._server.server_close()

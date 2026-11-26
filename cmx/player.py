@@ -42,7 +42,7 @@ from .interaction import InteractionEngine, resolve_zone, wall_command_refusal
 from .items import TEMPLATE, WEB, Item, classify
 from .kiosk import Kiosk
 from .lan_api import LanApiServer
-from . import ndi_out
+from . import ndi_in, ndi_out
 from .local_api import PORT as LOCAL_API_PORT, LocalApiServer, load_or_create_key
 from .playback import PAUSED, PLAYING, STOPPED, PlaylistEngine
 from .preview import PreviewPusher, encode_jpeg
@@ -215,6 +215,11 @@ class Player:
         self._ndi_receiver = ndi_engine.NDIReceiver() if ndi_engine else None
         self._ndi_sender = ndi_engine.NDISender() if ndi_engine else None
         self.ndi_output = ndi_out.NdiOutput(self._ndi_sender, self._make_ndi_source, settings.ndi_fps)
+        # NDI elements of templates: the page reads them as MJPEG from the renderer server
+        self.ndi_feeds: Optional[ndi_in.NdiFeeds] = None
+        if self.renderer is not None:
+            self.ndi_feeds = ndi_in.NdiFeeds(ndi_in.default_backend() if _ndi_available() else None)
+            self.renderer.ndi_feeds = self.ndi_feeds
         self._cms_ndi: Optional[bool] = None
         self._cms_ndi_name: Optional[str] = None
         self._ndi_refused: Optional[tuple] = None
@@ -388,6 +393,8 @@ class Player:
         if self.renderer is not None:
             self.renderer.stop()
         self.ndi_output.stop()
+        if self.ndi_feeds is not None:
+            self.ndi_feeds.close()
         if self._ndi_receiver:
             self._ndi_receiver.stop()
         if self._ndi_sender:

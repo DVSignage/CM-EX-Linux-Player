@@ -2,8 +2,8 @@
 Native templates: a CMS template definition → what the renderer page draws.
 
 Follows DVSI Plus `TemplateRenderer` / `NestedTemplates` / `TemplatePatcher`:
-  - element types text, panel, image, video, capture, rss, trigger_zone and
-    template (nested); any other type anywhere → the CMS web render instead;
+  - element types text, panel, image, video, capture, ndi, rss, trigger_zone,
+    web and template (nested); any other type anywhere → the CMS web render instead;
   - an under-configured element of a known type is an empty box, never a
     reason to fall back;
   - nested templates up to 3 levels deep, cycles cut, a child that cannot be
@@ -22,11 +22,12 @@ from typing import Awaitable, Callable, Dict, Optional, Set, Tuple
 
 from . import cache as cachemod
 from .interaction import Model
+from .ndi_in import source_for as ndi_source_for
 from .wallhost import canonical_keys
 
 log = logging.getLogger("player")
 
-KNOWN_TYPES = {"text", "panel", "image", "video", "capture", "rss", "trigger_zone", "template", "web"}
+KNOWN_TYPES = {"text", "panel", "image", "video", "capture", "ndi", "rss", "trigger_zone", "template", "web"}
 PATCHABLE = {"image", "video", "text", "capture", "rss"}
 MEDIA_KEYS = ("contentId", "content_id", "contentID", "mediaId", "media_id", "assetId", "asset_id")
 DEVICE_KEYS = ("deviceLabel", "device_label", "deviceId", "device_id", "label", "capture_device_label")
@@ -183,6 +184,10 @@ class TemplateBuilder:
                 el["device"] = device_label(props)
                 el["audio"] = capture_audio(props)
                 el["av_offset"] = av_offset(props)
+            elif etype == "ndi":
+                el["source"] = ndi_source_for(props)
+                if not el["source"]:
+                    log.info(f"[TEMPLATE] {tid}: NDI element names no source — empty slot")
             elif etype == "web":
                 el["src"] = str(props.get("src") or props.get("url") or "")
             elif etype == "template":
