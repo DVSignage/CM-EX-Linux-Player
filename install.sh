@@ -152,10 +152,10 @@ detect_display() {
     # (/run/user/<uid>/.mutter-Xwaylandauth.*) gets a new random name at every
     # login — so it is NOT written into the service; the player finds the live
     # one when it starts (cmx/display.py).
-    if ps aux | grep -q '[X]wayland' || ls /run/user/"$DESKTOP_UID"/wayland-* &>/dev/null; then
+    if ps -eo args= | grep -q '[X]wayland' || ls /run/user/"$DESKTOP_UID"/wayland-* &>/dev/null; then
         WAYLAND_SESSION=1
         local xw_cmd
-        xw_cmd=$(ps aux | grep '[X]wayland' | head -1)
+        xw_cmd=$(ps -eo args= | grep '[X]wayland' | head -1)
         if echo "$xw_cmd" | grep -qE ' :[0-9]+'; then
             X_DISPLAY=$(echo "$xw_cmd" | grep -oE ' :[0-9]+' | head -1 | tr -d ' ')
         fi
@@ -164,50 +164,59 @@ detect_display() {
         return
     fi
 
-    # Find XAUTHORITY from Xorg process command line
+    # X11. Read the Xorg arguments ONLY: `ps aux` also prints the start time
+    # (10:37), which a ':[0-9]+' match took for the display (DISPLAY=:37).
     local xorg_cmd
-    xorg_cmd=$(ps aux | grep -i '[Xx]org' | head -1)
+    xorg_cmd=$(ps -eo args= | grep -E '^[^ ]*[Xx]org( |$)' | head -1)
+    local d
+    d=$(echo "$xorg_cmd" | grep -oE '(^| ):[0-9]+( |$)' | head -1 | tr -d ' ')
+    [[ -n "$d" ]] && X_DISPLAY="$d"
 
-    # Extract -auth argument
-    if echo "$xorg_cmd" | grep -q '\-auth'; then
-        XAUTH_PATH=$(echo "$xorg_cmd" | sed 's/.*-auth \([^ ]*\).*/\1/')
+    # An Xauthority the PLAYER can use: the service runs as $DESKTOP_USER, so the
+    # X server's own -auth file (lightdm's /var/run/lightdm/root/:0 is root-only)
+    # only counts if that user can read it; the user's own file usually works.
+    local home_dir
+    home_dir=$(getent passwd "$DESKTOP_USER" | cut -d: -f6)
+    local candidates=()
+    if echo "$xorg_cmd" | grep -q -- ' -auth '; then
+        candidates+=("$(echo "$xorg_cmd" | sed 's/.* -auth \([^ ]*\).*/\1/')")
     fi
+    candidates+=("/run/user/$DESKTOP_UID/gdm/Xauthority" "${home_dir:-/home/$DESKTOP_USER}/.Xauthority"
+                 "/run/user/$DESKTOP_UID/.Xauthority")
 
-    # Fallback: check common locations
-    if [[ -z "$XAUTH_PATH" || ! -f "$XAUTH_PATH" ]]; then
-        for candidate in \
-            "/run/user/$DESKTOP_UID/gdm/Xauthority" \
-            "/home/$DESKTOP_USER/.Xauthority" \
-            "/run/user/$DESKTOP_UID/.Xauthority" \
-            "/tmp/.X11-unix/../.Xauthority"; do
-            if [[ -f "$candidate" ]]; then
-                XAUTH_PATH="$candidate"
-                break
-            fi
-        done
-    fi
+    # Checked AS the desktop user, the way the service will open the display.
+    as_user_can_open() {  # $1 = Xauthority path, or "" for none
+        local probe=""
+        if command -v xdpyinfo &>/dev/null; then probe="xdpyinfo"
+        elif command -v xset &>/dev/null; then probe="xset q"
+        else return 2; fi
+        runuser -u "$DESKTOP_USER" -- env DISPLAY="$X_DISPLAY" ${1:+XAUTHORITY="$1"} $probe &>/dev/null
+    }
 
-    # Detect display number from Xorg args
-    if echo "$xorg_cmd" | grep -qE ':[0-9]+'; then
-        X_DISPLAY=$(echo "$xorg_cmd" | grep -oE ':[0-9]+' | head -1)
-    fi
-
-    # Verify display works
-    if [[ -n "$XAUTH_PATH" ]]; then
-        if DISPLAY="$X_DISPLAY" XAUTHORITY="$XAUTH_PATH" xdpyinfo &>/dev/null; then
+    XAUTH_PATH=""
+    local c rc
+    for c in "${candidates[@]}"; do
+        [[ -n "$c" && -f "$c" ]] || continue
+        runuser -u "$DESKTOP_USER" -- test -r "$c" || continue
+        as_user_can_open "$c"; rc=$?
+        if [[ $rc -eq 0 ]]; then
+            XAUTH_PATH="$c"
             ok "Display: ${BOLD}$X_DISPLAY${NC}  Xauthority: ${BOLD}$XAUTH_PATH${NC}"
             return
+        elif [[ $rc -eq 2 ]]; then   # nothing to test with: take the first readable file
+            XAUTH_PATH="$c"
+            ok "Display: ${BOLD}$X_DISPLAY${NC}  Xauthority: ${BOLD}$XAUTH_PATH${NC} (not verified: no xdpyinfo/xset)"
+            return
         fi
-    fi
+    done
 
-    # Try without explicit XAUTHORITY (some setups work with just DISPLAY)
-    if su - "$DESKTOP_USER" -c "DISPLAY=$X_DISPLAY xdpyinfo" &>/dev/null 2>&1; then
+    # Some setups need no Xauthority at all
+    if as_user_can_open ""; then
         ok "Display: ${BOLD}$X_DISPLAY${NC}  (no explicit Xauthority needed)"
-        XAUTH_PATH=""
         return
     fi
 
-    warn "Could not verify display access. The service may need manual configuration."
+    warn "Could not verify display access for $DESKTOP_USER on $X_DISPLAY. The service may need manual configuration."
     warn "See: sudo nano /etc/systemd/system/signage-player.service"
 }
 
@@ -538,7 +547,10 @@ SYSTEMD_FILE="/etc/systemd/system/signage-player.service"
 cat > "$SYSTEMD_FILE" << SERVICEEOF
 [Unit]
 Description=Digital Signage Player Daemon
-After=network-online.target graphical.target
+# Started with the desktop (graphical.target, below), after the display manager.
+# NOT After=graphical.target: graphical.target waits for the units it wants, so
+# that is an ordering cycle and systemd drops the player's start at every boot.
+After=network-online.target display-manager.service
 Wants=network-online.target
 
 [Service]
@@ -562,9 +574,12 @@ $([ -n "$XAUTH_PATH" ] && echo "Environment=\"XAUTHORITY=$XAUTH_PATH\"")
 # Security
 NoNewPrivileges=true
 PrivateTmp=true
+# ...but the X server's sockets live in /tmp/.X11-unix: share that one folder, or
+# the player sees no display and waits for a desktop session that never comes.
+BindPaths=-/tmp/.X11-unix
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
 SERVICEEOF
 
 systemctl daemon-reload
@@ -618,7 +633,7 @@ fi
 
 step "Enabling and starting service"
 
-systemctl enable signage-player
+systemctl reenable signage-player   # reenable: moves an older multi-user.target link to graphical.target
 systemctl restart signage-player
 ok "signage-player service enabled and started"
 

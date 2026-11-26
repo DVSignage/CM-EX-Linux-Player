@@ -1,6 +1,8 @@
 [Unit]
 Description=Digital Signage Player Daemon
-After=network-online.target
+# With the desktop, after the display manager (not After=graphical.target: with
+# WantedBy=graphical.target that is an ordering cycle and the start is dropped).
+After=network-online.target display-manager.service
 Wants=network-online.target
 
 [Service]
@@ -21,6 +23,8 @@ Environment="XAUTHORITY=/home/signage/.Xauthority"
 # Security
 NoNewPrivileges=true
 PrivateTmp=true
+# the X server's sockets: shared, or the player cannot see the display
+BindPaths=-/tmp/.X11-unix
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target

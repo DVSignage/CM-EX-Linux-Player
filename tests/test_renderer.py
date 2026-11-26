@@ -119,3 +119,28 @@ def test_page_surface_template_web_and_screens(tmp_path):
     s.show_screen("enrollment", code="ABC", server="http://cms", site=None, link="dvsiconnect://enroll?v=1&code=ABC")
     m = server.sent[-1]
     assert m["name"] == "enrollment" and m["qr"].startswith("data:image/png;base64,")
+
+
+def test_taken_port_moves_up_instead_of_failing(tmp_path):
+    """Another program on 8090 (a kiosk service, a camera bridge) must not leave
+    the screen showing its answers: the page takes the next free port."""
+    import socket
+    from cmx.renderer import server as rs
+
+    for d in ("cache", "screens", "rss"):
+        (tmp_path / d).mkdir()
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    taken = holder.getsockname()[1]
+    srv = RendererServer(tmp_path / "cache", tmp_path / "screens", tmp_path / "rss", lambda e: None, port=taken)
+    try:
+        assert srv.start() is None
+        assert taken < srv.port <= taken + rs.FALLBACK_PORTS
+        assert srv.url == f"http://127.0.0.1:{srv.port}/"
+        conn = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=5)
+        conn.request("GET", "/")
+        assert conn.getresponse().status == 200
+    finally:
+        srv.stop()
+        holder.close()

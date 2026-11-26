@@ -1,7 +1,8 @@
 """
 The renderer server: the local web page Chromium shows full screen.
 
-Loopback only (127.0.0.1:8090 — 8083 is the control API, as on DVSI Plus). It serves
+Loopback only (127.0.0.1:8090 — 8083 is the control API, as on DVSI Plus; when another
+program already holds 8090 the next free port up to 8099 is used, see FALLBACK_PORTS). It serves
   /                  the renderer page (index.html, /static/*)
   /media/<name>      files from the content cache, with Range (video seeking)
   /screens/<name>    generated pictures (the enrollment QR code)
@@ -15,6 +16,7 @@ message is replayed to a page that (re)connects, so a crashed and restarted
 browser comes back showing the same thing.
 """
 
+import errno
 import json
 import logging
 import mimetypes
@@ -29,6 +31,10 @@ from urllib.parse import unquote
 log = logging.getLogger("player")
 
 PORT = 8090
+# Only this player's own Chromium opens the page, so its port need not be fixed: a
+# held 8090 (e.g. another kiosk service on the box) moves it up instead of leaving
+# the screen showing whatever that other program answers.
+FALLBACK_PORTS = 9
 STATIC_DIR = Path(__file__).parent / "static"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._\-]+$")
 # Message types that describe what is on screen; the latest of each group is
@@ -49,6 +55,7 @@ class RendererServer:
         self.screens_dir = screens_dir
         self.rss_dir = rss_dir
         self.port = port
+        self._wanted_port = port      # start() falls back from here when it is taken
         self.host = host
         self._on_event = on_event
         self._clients: List[queue.Queue] = []
@@ -247,12 +254,23 @@ class RendererServer:
             def handle_error(self, request, client_address):
                 log.debug("[RENDERER] a page connection dropped")   # a closing browser, not an error
 
-        try:
-            self._server = Server((self.host, self.port), Handler)
-            self.port = self._server.server_address[1]
-        except OSError as e:
-            log.error(f"[RENDERER] cannot listen on {self.host}:{self.port}: {e}")
-            return str(e)
+        wanted = self._wanted_port
+        ports = [wanted] + ([wanted + i for i in range(1, FALLBACK_PORTS + 1)] if wanted else [])
+        error: Optional[OSError] = None
+        for port in ports:
+            try:
+                self._server = Server((self.host, port), Handler)
+                break
+            except OSError as e:
+                error = e
+                if e.errno != errno.EADDRINUSE:
+                    break
+        if self._server is None:
+            log.error(f"[RENDERER] cannot listen on {self.host}:{wanted}: {error}")
+            return str(error)
+        self.port = self._server.server_address[1]
+        if wanted and self.port != wanted:
+            log.warning(f"[RENDERER] port {wanted} is held by another program; the page uses {self.port}")
         threading.Thread(target=self._server.serve_forever, daemon=True, name="renderer").start()
         log.info(f"Renderer page at {self.url}")
         return None
