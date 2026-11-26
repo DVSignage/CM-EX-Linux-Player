@@ -2,6 +2,18 @@
 
 All notable changes to the CM:EX Linux Player.
 
+## [Unreleased]
+
+### Fixed
+- `install.sh` stopped silently after "Desktop user" on Ubuntu 24.04 (GNOME
+  46) when no X11 app had opened yet: Xwayland starts on demand, so the
+  display lookup found no Xwayland process and `set -e` ended the install.
+  It now keeps `:0`, where mutter starts Xwayland for the player.
+- A snap Chromium (Ubuntu's only Chromium) never stayed on screen: the
+  service's `NoNewPrivileges=true` stops the setuid snap-confine, so the kiosk
+  exited with code 1 at every launch. `install.sh` leaves it off when
+  Chromium is a snap.
+
 ## [2.4.0] - 2026-11-24
 
 ### Added
