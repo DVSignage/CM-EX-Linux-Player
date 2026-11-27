@@ -9,6 +9,7 @@ of the scripts and run in bash with ps / pgrep / ls / loginctl / snap stubbed.
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,11 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ["install.sh", "offline-install.sh"]
 
-pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+pytestmark = [
+    pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash"),
+    # Git Bash's ps, getent and friends answer differently from Linux's
+    pytest.mark.skipif(sys.platform == "win32", reason="the installers run on Linux"),
+]
 
 # The helpers and globals the functions lean on, under the scripts' own strict
 # mode: an unguarded pipeline that finds nothing ends the install there.
@@ -114,6 +119,9 @@ ps() { printf '/usr/bin/gnome-shell\n/usr/bin/Xwayland :1 -rootless -noreset -au
 @pytest.mark.parametrize("script", SCRIPTS)
 def test_x11_display_is_read_from_xorg_arguments_not_start_time(script, tmp_path):
     # lightdm's -auth file is root-only; the desktop user's own file opens the display.
+    # The scripts probe through `runuser … env DISPLAY=… xdpyinfo`; `env` would skip the
+    # xdpyinfo stub and run the real tool (no display here), so the runuser stub drops
+    # `env` and its assignments and calls the stub directly.
     home = tmp_path / "dvsi"
     home.mkdir()
     (home / ".Xauthority").write_text("cookie")
@@ -129,7 +137,7 @@ ps() {{
 }}
 getent() {{ echo "dvsi:x:1000:1000::{home}:/bin/bash"; }}
 xdpyinfo() {{ return 0; }}
-runuser() {{ shift 3; "$@"; }}
+runuser() {{ shift 3; [[ "$1" == env ]] && {{ shift; while [[ "$1" == *=* ]]; do shift; done; }}; "$@"; }}
 su() {{ return 1; }}
 """)
     assert r.returncode == 0, r.stderr
@@ -153,7 +161,7 @@ pgrep() {{ return 1; }}
 ls() {{ return 1; }}
 ps() {{ printf '/usr/lib/xorg/Xorg :0 -seat seat0 -auth /var/run/lightdm/root/:0 vt7\n'; }}
 getent() {{ echo "dvsi:x:1000:1000::{home}:/bin/bash"; }}
-runuser() {{ shift 3; "$@"; }}
+runuser() {{ shift 3; [[ "$1" == env ]] && {{ shift; while [[ "$1" == *=* ]]; do shift; done; }}; "$@"; }}
 su() {{ return 1; }}
 """)
     assert r.returncode == 0, f"install stopped in detect_display: {r.stdout!r} {r.stderr!r}"
@@ -169,7 +177,7 @@ ls() {{ return 1; }}
 ps() {{ printf '/usr/sbin/sshd -D\n'; }}
 getent() {{ echo "dvsi:x:1000:1000::{tmp_path}:/bin/bash"; }}
 xdpyinfo() {{ return 1; }}
-runuser() {{ shift 3; "$@"; }}
+runuser() {{ shift 3; [[ "$1" == env ]] && {{ shift; while [[ "$1" == *=* ]]; do shift; done; }}; "$@"; }}
 su() {{ return 1; }}
 """)
     assert r.returncode == 0, f"install stopped in detect_display: {r.stdout!r} {r.stderr!r}"
