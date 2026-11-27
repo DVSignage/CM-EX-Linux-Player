@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from . import cdp
 from .browser import DISABLED_FEATURES, FLAGS, find_chromium, profile_dir_for, root_flags
 from .cdp import PORT as CDP_PORT
 
@@ -30,16 +31,22 @@ HANG_SECONDS = 25.0          # no "alive" from the page for this long = hung
 STARTUP_GRACE = 30.0
 WINDOW = 300.0               # recoveries counted over five minutes
 FAULT_AFTER = 3
+FIT_EVERY = 5.0              # how often the window is checked against the screen
+FIT_RETRY = 30.0             # a refit that did not stick is retried this slowly (no flapping)
 
 
 class Kiosk:
     def __init__(self, display: str, profile_dir: Path, url: str,
-                 on_recovery: Optional[Callable[[dict], None]] = None, clock=time.monotonic):
+                 on_recovery: Optional[Callable[[dict], None]] = None, clock=time.monotonic,
+                 fit: Callable[[str], Optional[str]] = cdp.fit_fullscreen):
         self.display = display
         self.profile_dir = profile_dir
         self.url = url
         self._on_recovery = on_recovery
         self._clock = clock
+        self._fit = fit
+        self._next_fit = 0.0
+        self._refits_in_row = 0
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._task: Optional[asyncio.Task] = None
         self._stopping = False
@@ -106,6 +113,8 @@ class Kiosk:
             log.error(f"[KIOSK] could not launch Chromium: {e}")
             return False
         self._started_at = self._last_alive = self._clock()
+        self._next_fit = 0.0
+        self._refits_in_row = 0
         self.last_error = None
         log.info(f"[KIOSK] Chromium showing {self.url}")
         return True
@@ -147,3 +156,23 @@ class Kiosk:
             if now - self._started_at > STARTUP_GRACE and now - self._last_alive > HANG_SECONDS:
                 await self._kill()
                 return "unresponsive", f"no report from the page for {HANG_SECONDS:.0f}s", None
+            await self._keep_fullscreen()
+
+    async def _keep_fullscreen(self) -> None:
+        """Every few seconds, the window back over the whole screen if a screen
+        change (TV off and on, HDMI replug, a new RDP session) left it smaller."""
+        now = self._clock()
+        if now - self._started_at < FIT_EVERY or now < self._next_fit:
+            return
+        self._next_fit = now + FIT_EVERY
+        try:
+            fixed = await asyncio.get_running_loop().run_in_executor(None, self._fit, self.url)
+        except Exception:
+            return
+        if not fixed:
+            self._refits_in_row = 0
+            return
+        self._refits_in_row += 1
+        if self._refits_in_row > 1:       # wrong again right after a refit: it does not stick here
+            self._next_fit = self._clock() + FIT_RETRY
+        log.info(f"[KIOSK] window was {fixed}; back to fullscreen")

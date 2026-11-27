@@ -38,6 +38,15 @@ All notable changes to the CM:EX Linux Player.
   user can open, and the service unit that starts at boot (`WantedBy=
   graphical.target`, no ordering cycle) and can see the X sockets
   (`BindPaths=-/tmp/.X11-unix`).
+- The kiosk could be left as a window instead of covering the screen after
+  the screen changed under it (a TV switched off and on, an HDMI replug, a new
+  RDP session's virtual monitor, or a start with no screen yet): Chromium
+  still reported "fullscreen" at the old size. The player now checks the
+  window against the screen every 5 s over DevTools and refits it
+  (`[KIOSK] window was 1050x811 on a 1600x900 screen; back to fullscreen`); a
+  refit that does not stick is retried every 30 s instead.
+- `install.sh` and `offline-install.sh` are executable again (lost in the
+  previous fix), so `./install.sh` works as well as `bash install.sh`.
 
 ## [2.4.0] - 2026-11-24
 
