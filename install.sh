@@ -99,10 +99,11 @@ detect_desktop_user() {
         info "Using user from --user flag: $DESKTOP_USER"
     fi
 
-    # Method 1: Find who owns the running Xorg process
+    # Method 1: Find who owns the running Xorg process. A Wayland desktop has
+    # none: the grep finds nothing, which must not end the install (pipefail).
     if [[ -z "$DESKTOP_USER" ]]; then
         local xorg_user
-        xorg_user=$(ps -eo user,comm | grep -i '[Xx]org' | head -1 | awk '{print $1}')
+        xorg_user=$(ps -eo user,comm | grep -i '[Xx]org' | head -1 | awk '{print $1}' || true)
         if [[ -n "$xorg_user" && "$xorg_user" != "root" ]]; then
             DESKTOP_USER="$xorg_user"
         fi
@@ -124,7 +125,7 @@ detect_desktop_user() {
     # Method 3: Check who owns tty1/tty2
     if [[ -z "$DESKTOP_USER" ]]; then
         local tty_user
-        tty_user=$(who | grep -E 'tty[12]' | head -1 | awk '{print $1}')
+        tty_user=$(who | grep -E 'tty[12]' | head -1 | awk '{print $1}' || true)
         [[ -n "$tty_user" ]] && DESKTOP_USER="$tty_user"
     fi
 
@@ -152,10 +153,14 @@ detect_display() {
     # (/run/user/<uid>/.mutter-Xwaylandauth.*) gets a new random name at every
     # login — so it is NOT written into the service; the player finds the live
     # one when it starts (cmx/display.py).
-    if ps -eo args= | grep -q '[X]wayland' || ls /run/user/"$DESKTOP_UID"/wayland-* &>/dev/null; then
+    # GNOME 46+ starts Xwayland on demand: until an X11 app opens there is no
+    # Xwayland process, and an unguarded grep that finds nothing ends the whole
+    # install here (set -e + pipefail). The display then stays :0, where mutter
+    # listens and starts Xwayland for the player's first window.
+    if pgrep -x Xwayland &>/dev/null || ls /run/user/"$DESKTOP_UID"/wayland-* &>/dev/null; then
         WAYLAND_SESSION=1
         local xw_cmd
-        xw_cmd=$(ps -eo args= | grep '[X]wayland' | head -1)
+        xw_cmd=$(ps -eo args= | grep '[X]wayland' | head -1 || true)
         if echo "$xw_cmd" | grep -qE ' :[0-9]+'; then
             X_DISPLAY=$(echo "$xw_cmd" | grep -oE ' :[0-9]+' | head -1 | tr -d ' ')
         fi
@@ -166,10 +171,11 @@ detect_display() {
 
     # X11. Read the Xorg arguments ONLY: `ps aux` also prints the start time
     # (10:37), which a ':[0-9]+' match took for the display (DISPLAY=:37).
+    # No Xorg yet (installed before the desktop is up): keep :0 and carry on.
     local xorg_cmd
-    xorg_cmd=$(ps -eo args= | grep -E '^[^ ]*[Xx]org( |$)' | head -1)
+    xorg_cmd=$(ps -eo args= | grep -E '^[^ ]*[Xx]org( |$)' | head -1 || true)
     local d
-    d=$(echo "$xorg_cmd" | grep -oE '(^| ):[0-9]+( |$)' | head -1 | tr -d ' ')
+    d=$(echo "$xorg_cmd" | grep -oE '(^| ):[0-9]+( |$)' | head -1 | tr -d ' ' || true)
     [[ -n "$d" ]] && X_DISPLAY="$d"
 
     # An Xauthority the PLAYER can use: the service runs as $DESKTOP_USER, so the
@@ -198,7 +204,7 @@ detect_display() {
     for c in "${candidates[@]}"; do
         [[ -n "$c" && -f "$c" ]] || continue
         runuser -u "$DESKTOP_USER" -- test -r "$c" || continue
-        as_user_can_open "$c"; rc=$?
+        rc=0; as_user_can_open "$c" || rc=$?   # 1 / 2 are answers, not errors (set -e)
         if [[ $rc -eq 0 ]]; then
             XAUTH_PATH="$c"
             ok "Display: ${BOLD}$X_DISPLAY${NC}  Xauthority: ${BOLD}$XAUTH_PATH${NC}"
@@ -544,6 +550,19 @@ step "Installing systemd service"
 
 SYSTEMD_FILE="/etc/systemd/system/signage-player.service"
 
+# Ubuntu's Chromium is a snap, started through snap-confine, which is setuid
+# root: under NoNewPrivileges=true it refuses to run ("snap-confine is packaged
+# without necessary permissions") and the kiosk exits with code 1 at every launch.
+chromium_is_snap() {
+    command -v snap &>/dev/null && snap list chromium &>/dev/null
+}
+
+NO_NEW_PRIVILEGES=true
+if chromium_is_snap; then
+    NO_NEW_PRIVILEGES=false
+    info "Chromium is a snap — the service runs without NoNewPrivileges so snap-confine can start it"
+fi
+
 cat > "$SYSTEMD_FILE" << SERVICEEOF
 [Unit]
 Description=Digital Signage Player Daemon
@@ -571,8 +590,8 @@ Environment="XDG_RUNTIME_DIR=/run/user/$DESKTOP_UID"
 Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$DESKTOP_UID/bus"
 $([ -n "$XAUTH_PATH" ] && echo "Environment=\"XAUTHORITY=$XAUTH_PATH\"")
 
-# Security
-NoNewPrivileges=true
+# Security (no NoNewPrivileges for a snap Chromium: see chromium_is_snap above)
+NoNewPrivileges=$NO_NEW_PRIVILEGES
 PrivateTmp=true
 # ...but the X server's sockets live in /tmp/.X11-unix: share that one folder, or
 # the player sees no display and waits for a desktop session that never comes.

@@ -110,7 +110,7 @@ CMX.template = (() => {
     hint.className = "hint";
     node.append(v, hint);
     const slot = CMX.capture ? CMX.capture.attach(v, hint, e.device, e.audio, null, e.av_offset || 0) : null;
-    if (cur && slot) cur.captures.push(slot);
+    if (slot) { node.cmxCapture = slot; if (cur) cur.captures.push(slot); }
     return node;
   }
 
@@ -145,6 +145,18 @@ CMX.template = (() => {
   // now rather than whenever the image is collected.
   function closeNdi(node) {
     for (const img of node.querySelectorAll("img[data-ndi]")) { delete img.dataset.ndi; img.removeAttribute("src"); }
+  }
+
+  // A tile taken off the canvas (an edit swapped or removed it) lets go of its
+  // camera; otherwise the old stream kept running, unseen, next to the new one.
+  function release(node) {
+    for (const el of [node, ...node.querySelectorAll(".el.capture")]) {
+      const slot = el.cmxCapture;
+      if (!slot) continue;
+      slot.stop();
+      el.cmxCapture = null;
+      if (cur) cur.captures = cur.captures.filter((s) => s !== slot);
+    }
   }
 
   function buildNested(payload, e) {
@@ -342,6 +354,7 @@ CMX.template = (() => {
       node.style.opacity = "1";
       if (old) setTimeout(() => {
         for (const ov of old.node.querySelectorAll("video")) { ov.pause(); cur && cur.videos.delete(ov); }
+        release(old.node);
         closeNdi(old.node);
         old.node.remove();
       }, 450);
@@ -370,7 +383,7 @@ CMX.template = (() => {
       if (oldDefs.get(e.id) !== JSON.stringify(e)) swap(e.id, e, m);
     }
     for (const [id, rec] of cur.els) {
-      if (!keep.has(id)) { rec.node.style.transition = "opacity 400ms ease"; rec.node.style.opacity = "0"; setTimeout(() => { closeNdi(rec.node); rec.node.remove(); }, 450); cur.els.delete(id); }
+      if (!keep.has(id)) { rec.node.style.transition = "opacity 400ms ease"; rec.node.style.opacity = "0"; release(rec.node); setTimeout(() => { closeNdi(rec.node); rec.node.remove(); }, 450); cur.els.delete(id); }
     }
     CMX.state.gen = m.gen;
   }

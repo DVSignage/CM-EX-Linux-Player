@@ -2,7 +2,7 @@
 
 All notable changes to the CM:EX Linux Player.
 
-## [2.5.0] - 2026-11-26
+## [2.5.0] - 2026-11-27
 
 ### Added
 - NDI sources inside templates: the CMS's `ndi` element (`props.sourceName`)
@@ -22,6 +22,39 @@ All notable changes to the CM:EX Linux Player.
   overloaded a Raspberry Pi 4.
 - The renderer's port fallback also applies when Windows reports a held port
   as "access denied" (test runs on Windows).
+- The renderer page froze every 1 h 48 min and the kiosk watchdog relaunched
+  Chromium (a few seconds of black screen each time): the page's reports to
+  the player (2.5 a second) never read the reply, and each unread reply kept a
+  shared-memory handle open until the page ran out at about 16 000. The reply
+  is now cancelled.
+- A template's camera tile stayed on "Waiting for signal…" when its sound
+  could not be opened (a camera without a microphone, a Raspberry Pi has none
+  of its own): one failed device fails the whole request. The page now asks
+  for the camera's own microphone (same device group) and shows the picture
+  without sound when there is none or it fails. A camera or microphone that
+  never answers is given up after 10 s instead of leaving the tile blank.
+- Editing a template on the CMS left the replaced or removed camera tile's
+  stream open next to the new one (a second decode of every frame on a Pi).
+- Camera failures reached no log: the page now reports each new reason
+  (`[RENDERER] capture …: NotFoundError …`), once, not on every retry.
+- `install.sh` stopped silently after "Desktop user" on Ubuntu 24.04 (GNOME
+  46) when no X11 app had opened yet: Xwayland starts on demand, so the
+  display lookup found no Xwayland process and `set -e` ended the install.
+  It now keeps `:0`, where mutter starts Xwayland for the player.
+- A snap Chromium (Ubuntu's only Chromium) never stayed on screen: the
+  service's `NoNewPrivileges=true` stops the setuid snap-confine, so the kiosk
+  exited with code 1 at every launch. `install.sh` leaves it off when
+  Chromium is a snap.
+- `install.sh` could also stop silently on a desktop without Xorg when no
+  `--user` was given, on X11 without `xdpyinfo`/`xset`, or before any display
+  server was up: lookups that find nothing, or a display check that answers
+  "no", no longer end the install.
+- `offline-install.sh` caught up with `install.sh`: the same detection fixes
+  and snap check, the display read from the Xorg arguments (not `ps aux`,
+  whose start time 10:37 became `DISPLAY=:37`) with an Xauthority the desktop
+  user can open, and the service unit that starts at boot (`WantedBy=
+  graphical.target`, no ordering cycle) and can see the X sockets
+  (`BindPaths=-/tmp/.X11-unix`).
 
 ## [2.4.0] - 2026-11-24
 
