@@ -1,5 +1,6 @@
 """
-NDI sources inside templates (DVSI Plus `StartTemplateNdi`).
+NDI sources in the renderer page: template `ndi` elements (DVSI Plus
+`StartTemplateNdi`) and the full-screen `show_ndi` / `show_ndi_wall`.
 
 A template's `ndi` element names a source on the network (props.sourceName,
 as "MACHINE (Sender)"). The page shows it as an <img> on a local MJPEG stream
@@ -16,7 +17,9 @@ source and turns its frames into JPEGs for that stream.
     seconds) the stream shows a "waiting" picture instead of going black.
   - Each stream scales to the size the element is drawn at and is capped at
     `fps`, so a small element on a small board costs little.
-  - Video only: an NDI sender's sound is not played inside a template.
+  - A video-wall screen asks for its region (`crop`, normalised x/y/w/h);
+    only that part is scaled and encoded.
+  - Video only: an NDI sender's sound is not played.
 """
 
 import io
@@ -75,6 +78,33 @@ def fit_size(w: int, h: int, max_w: int, max_h: int) -> Tuple[int, int]:
     max_h = min(max_h or MAX_EDGE, MAX_EDGE)
     s = min(1.0, max_w / w if w else 1.0, max_h / h if h else 1.0)
     return max(1, round(w * s)), max(1, round(h * s))
+
+
+Crop = Tuple[float, float, float, float]
+
+
+def parse_crop(x, y, w, h) -> Optional[Crop]:
+    """A normalised region from query values; None when absent, empty or the whole frame."""
+    try:
+        x, y, w, h = (float(v) for v in (x, y, w, h))
+    except (TypeError, ValueError):
+        return None
+    x, y = max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
+    w, h = min(w, 1.0 - x), min(h, 1.0 - y)
+    if w <= 0 or h <= 0 or (x, y, w, h) == (0.0, 0.0, 1.0, 1.0):
+        return None
+    return x, y, w, h
+
+
+def crop_frame(frame, crop: Optional[Crop]):
+    """The part of a frame a normalised crop names (at least one pixel)."""
+    if not crop:
+        return frame
+    h, w = frame.shape[:2]
+    x1, y1 = int(crop[0] * w), int(crop[1] * h)
+    x2, y2 = int(round((crop[0] + crop[2]) * w)), int(round((crop[1] + crop[3]) * h))
+    x1, y1 = min(x1, w - 1), min(y1, h - 1)
+    return frame[y1:max(y1 + 1, min(y2, h)), x1:max(x1 + 1, min(x2, w))]
 
 
 def encode_jpeg(frame, max_w: int = 0, max_h: int = 0, quality: int = JPEG_QUALITY) -> bytes:
@@ -362,7 +392,8 @@ class NdiFeeds:
 
     # -- one MJPEG stream ----------------------------------------------------
 
-    def frames(self, feed: Feed, max_w: int = 0, max_h: int = 0, stop: Optional[threading.Event] = None):
+    def frames(self, feed: Feed, max_w: int = 0, max_h: int = 0, stop: Optional[threading.Event] = None,
+               crop: Optional[Crop] = None):
         """JPEGs for one stream: a frame when a new one arrived (at most
         `fps` a second), the waiting picture while there is none. Ends when
         the feed stops or `stop` is set."""
@@ -377,7 +408,7 @@ class NdiFeeds:
                 seq = feed.seq
                 frame = feed.frame
                 try:
-                    yield encode_jpeg(frame, max_w, max_h)
+                    yield encode_jpeg(crop_frame(frame, crop), max_w, max_h)
                 except Exception as e:
                     log.warning(f"[NDI-IN] encoding a frame of '{feed.name}' failed: {e}")
                 shown_state = state

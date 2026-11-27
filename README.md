@@ -487,7 +487,7 @@ X11 session the whole display is sent; on Wayland the renderer page itself
 (Chromium screencast). Needs `pip install -r requirements-ndi.txt`; expect
 noticeable CPU at 1080p 30 fps on small boards — lower `ndi.fps` there.
 
-**NDI in templates.** A template's NDI element (`props.sourceName`, e.g.
+**NDI in templates and full screen.** A template's NDI element (`props.sourceName`, e.g.
 `STUDIO (Camera 1)`; a part of the name is enough) shows that source live. The
 player receives it and hands the page a picture stream scaled to the element,
 so one receiver serves every element showing the same source. Until the sender
@@ -495,6 +495,14 @@ is on the network the element shows "Waiting for NDI source", and "No signal"
 when frames stop; it connects by itself when the sender appears. The receiver
 stops a few seconds after the template leaves the screen. Pictures only: the
 source's sound is not played. Needs the same `requirements-ndi.txt`.
+
+`show_ndi` shows a source full screen the same way, in the page, so it works
+on Wayland too and shares the receiver with any template showing that source.
+`show_ndi_wall` cuts this screen's region (`wall_crop`) out of the source and
+stretches it over the screen; only that region is encoded. `hide_ndi` (or any
+playlist, capture or wall command) gives the screen back. The heartbeat reports
+`ndi_receive_active` / `ndi_receive_source`. A player running mpv only (no
+Chromium) still uses the separate OpenCV window.
 
 **Ubuntu desktop / Wayland.** The player stays on X11 through XWayland and finds
 the session's auth file itself at every start, so stock Ubuntu (GNOME on

@@ -9,8 +9,8 @@ program already holds 8090 the next free port up to 8099 is used, see FALLBACK_P
   /events            a Server-Sent Events stream: what the page should show
   /api/event   POST  what the page reports back (ended, status, taps, ...)
   /api/rss/<cid>     the cached headlines of a feed
-  /ndi/stream        ?source=&w=&h= an NDI source as MJPEG, for a template's
-                     `ndi` element (see cmx/ndi_in.py)
+  /ndi/stream        ?source=&w=&h=[&cx=&cy=&cw=&ch=] an NDI source as MJPEG, for
+                     a template's `ndi` element or full-screen NDI (cmx/ndi_in.py)
 
 The player side talks to it through `send()` (to every page) and an event
 callback that is handed to the asyncio loop thread-safely. The last "show"
@@ -41,7 +41,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._\-]+$")
 # Message types that describe what is on screen; the latest of each group is
 # replayed to a page that connects.
-STICKY = {"screen", "media", "web", "template", "capture", "stop"}
+STICKY = {"screen", "media", "web", "template", "capture", "ndi", "stop"}
 STICKY_EXTRA = {"volume", "config", "overlay", "crop", "pause"}
 
 mimetypes.add_type("video/mp4", ".mp4")
@@ -251,7 +251,8 @@ class RendererServer:
                     self.send_header("Cache-Control", "no-store")
                     self.send_header("Connection", "close")
                     self.end_headers()
-                    for jpg in feeds.frames(feed, size("w"), size("h"), srv._stopping):
+                    crop = ndi_in.parse_crop(*((q.get(k) or [None])[0] for k in ("cx", "cy", "cw", "ch")))
+                    for jpg in feeds.frames(feed, size("w"), size("h"), srv._stopping, crop):
                         self.wfile.write(b"--ndiframe\r\nContent-Type: image/jpeg\r\nContent-Length: "
                                          + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
                         self.wfile.flush()

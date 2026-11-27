@@ -168,6 +168,7 @@ class Player:
         self._last_empty_fetch = 0.0
         self._wall_key: Optional[str] = None
         self._ndi_active_key: Optional[str] = None
+        self._ndi_page: Optional[str] = None     # the source full-screen NDI shows in the page
         self._live_key: Optional[str] = None
         self._last_blank: Optional[bool] = None
         self._brightness_logged = False
@@ -765,6 +766,9 @@ class Player:
         if self._ndi_receiver and self._ndi_receiver.active:
             body["ndi_receive_active"] = True
             body["ndi_receive_source"] = self._ndi_receiver.source_name
+        elif self._ndi_page_on():
+            body["ndi_receive_active"] = True
+            body["ndi_receive_source"] = self._ndi_page
         return body
 
     def compute_error(self) -> Optional[str]:
@@ -1289,7 +1293,9 @@ class Player:
                     return
                 log.info("[WALL STREAM] same stream but mpv idle — reopening")
             self._cancel_wall()
-            self._ndi_active_key = key
+            if self._ndi_page_on():
+                await self.surface.stop()
+            self._ndi_active_key, self._ndi_page = key, None
             self._wall_task = asyncio.ensure_future(self._play_wall_rtp(url, crop))
 
         elif cmd == "stop_wall":
@@ -1305,42 +1311,58 @@ class Player:
                 self._live_key = None
                 await self.engine.resume()
 
-        elif cmd == "show_ndi":
+        elif cmd in ("show_ndi", "show_ndi_wall"):
             name = a.get("source_name") or a.get("ndi_source_name")
-            if name and self._ndi_receiver:
-                key = f"ndi_{name}"
-                if key == self._ndi_active_key:
-                    return
-                self._ndi_active_key = key
-                await self.engine.suspend()
-                await self.surface.stop()
-                await asyncio.to_thread(self._ndi_receiver.start, name)
+            crop = a.get("wall_crop") if cmd == "show_ndi_wall" else None
+            if name:
+                await self._show_ndi(str(name).strip(), crop)
 
         elif cmd == "hide_ndi":
             if self._ndi_receiver:
                 self._ndi_receiver.stop()
-            self._ndi_active_key = None
+            was_page = self._ndi_page_on()
+            self._ndi_active_key = self._ndi_page = None
+            if was_page:
+                await self.surface.stop()      # closes the page's stream: the receiver is released
             await self.engine.resume()
-
-        elif cmd == "show_ndi_wall":
-            name = a.get("source_name") or a.get("ndi_source_name")
-            crop = a.get("wall_crop")
-            if name and self._ndi_receiver:
-                key = f"ndi_{name}_{json.dumps(crop, sort_keys=True)}"
-                if key == self._ndi_active_key:
-                    return
-                self._ndi_active_key = key
-                await self.engine.suspend()
-                await self.surface.stop()
-                n = normalise_crop(crop)
-                ndi_crop = {"x": n[0], "y": n[1], "w": n[2], "h": n[3]} if n else None
-                await asyncio.to_thread(self._ndi_receiver.start, name, ndi_crop)
 
         elif cmd == "start_ndi_broadcast":
             await self._set_cms_ndi(True, a.get("ndi_broadcast_name") or a.get("name"))
 
         elif cmd == "stop_ndi_broadcast":
             await self._set_cms_ndi(False, None)
+
+    def _ndi_page_on(self) -> bool:
+        return bool(self._ndi_page and self._ndi_active_key and self._ndi_active_key.startswith("ndi_"))
+
+    async def _show_ndi(self, name: str, crop: Optional[dict]) -> None:
+        """Full-screen NDI: in the renderer page (the same stream and shared
+        receiver as a template's NDI element), or the OpenCV window when the
+        player runs mpv only."""
+        n = normalise_crop(crop)
+        key = f"ndi_{name}" + (f"_{json.dumps(crop, sort_keys=True)}" if crop is not None else "")
+        if key == self._ndi_active_key:
+            return
+        if self.page_mode:
+            if not (self.ndi_feeds and self.ndi_feeds.available):
+                log.warning(f"[NDI] cannot show '{name}': NDI runtime (ndi-python) not installed")
+                return
+            self._cancel_wall()
+            self._wall_key = self._live_key = None
+            self._ndi_active_key, self._ndi_page = key, name
+            await self.engine.suspend()
+            log.info(f"[NDI] showing '{name}' full screen in the page" + (f" (wall region {n})" if n else ""))
+            self.surface.send({"type": "ndi", "gen": self.surface.gen + 1, "source": name,
+                               "crop": list(n) if n else None})
+            return
+        if not self._ndi_receiver:
+            log.warning(f"[NDI] cannot show '{name}': NDI runtime (ndi-python) not installed")
+            return
+        self._ndi_active_key = key
+        await self.engine.suspend()
+        await self.surface.stop()
+        ndi_crop = {"x": n[0], "y": n[1], "w": n[2], "h": n[3]} if n else None
+        await asyncio.to_thread(self._ndi_receiver.start, name, ndi_crop)
 
     @staticmethod
     def _duration(a: dict) -> float:
@@ -1391,7 +1413,7 @@ class Player:
         """A playlist or direct pick takes the screen back from any wall or live input."""
         self._cancel_wall()
         self._wall_key = None
-        self._ndi_active_key = None
+        self._ndi_active_key = self._ndi_page = None
         self._live_key = None
         if self._ndi_receiver and self._ndi_receiver.active:
             self._ndi_receiver.stop()

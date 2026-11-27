@@ -11,6 +11,12 @@ All notable changes to the CM:EX Linux Player.
   the element and capped at 25 fps; "Waiting for NDI source" until the sender
   appears (it keeps looking, as DVSI Plus does), "No signal" when frames stop;
   stopped 3 s after the last element showing it leaves. Video only.
+- Full-screen NDI (`show_ndi`, `show_ndi_wall`) in the renderer page instead
+  of a separate OpenCV window over the kiosk: the same stream and shared
+  receiver as template elements, so it also works on Wayland and shows in the
+  preview and the NDI output. A wall screen's region is cut out by the player
+  and stretched over the screen. The heartbeat reports `ndi_receive_active` /
+  `ndi_receive_source`. mpv-only players keep the OpenCV window.
 
 ### Fixed
 - Raspberry Pi OS: the service starts at boot (no ordering cycle with

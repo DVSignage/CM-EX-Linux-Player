@@ -3,7 +3,7 @@
 html, body { margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden;
   font-family: "Inter", "DejaVu Sans", "Liberation Sans", sans-serif; cursor: none; }
 
-#stage, #media, .layer, #web, #snapshot, #template, #capture, #music, #screen {
+#stage, #media, .layer, #web, #snapshot, #template, #capture, #ndi, #music, #screen {
   position: absolute; inset: 0; }
 .layer { opacity: 0; transition: opacity var(--fade) ease; overflow: hidden; }
 .layer.on { opacity: 1; }
@@ -31,6 +31,9 @@ html, body { margin: 0; height: 100%; background: #000; color: #fff; overflow: h
 
 #capture { display: none; background: #000; }
 #capture video { width: 100%; height: 100%; object-fit: contain; }
+#ndi { display: none; background: #000; }
+#ndi img { width: 100%; height: 100%; object-fit: contain; display: block; }
+#ndi.wall img { object-fit: fill; }
 
 #music { display: none; align-items: center; justify-content: center;
   background: radial-gradient(circle at 30% 20%, #10241b, #000 70%); }

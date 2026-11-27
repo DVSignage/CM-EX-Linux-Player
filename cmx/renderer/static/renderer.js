@@ -36,7 +36,7 @@ const CMX = (() => {
 
   // Which full-screen surface is visible. Everything else is hidden (and its
   // media paused by its owner) so nothing plays underneath.
-  const SURFACES = ["media", "web", "snapshot", "template", "capture", "screen"];
+  const SURFACES = ["media", "web", "snapshot", "template", "capture", "ndi", "screen"];
   function showSurface(name) {
     for (const s of SURFACES) {
       const el = $(s);
@@ -47,8 +47,43 @@ const CMX = (() => {
     if (name !== "web") { const f = $("web"); if (f.src && f.src !== "about:blank") f.src = "about:blank"; }
     if (name !== "template" && CMX.template) CMX.template.clear();
     if (name !== "capture" && CMX.capture) CMX.capture.stopFullscreen();
+    if (name !== "ndi") ndi.stop();
     if (name !== "media") media.release();
   }
+
+  // Full-screen NDI (show_ndi / show_ndi_wall): the source as an MJPEG stream from the
+  // renderer server at the screen's size; a wall screen's region is cut out there and
+  // stretched over the screen, as the mpv wall path does. Closing the stream when the
+  // surface goes releases the player's receiver.
+  const ndi = (() => {
+    let cur = null;
+    const img = () => $("ndi").querySelector("img");
+    function url(m) {
+      const dpr = window.devicePixelRatio || 1;
+      let u = `/ndi/stream?source=${encodeURIComponent(m.source)}` +
+        `&w=${Math.round(innerWidth * dpr)}&h=${Math.round(innerHeight * dpr)}&r=${Date.now()}`;
+      if (m.crop) u += `&cx=${m.crop[0]}&cy=${m.crop[1]}&cw=${m.crop[2]}&ch=${m.crop[3]}`;
+      return u;
+    }
+    function show(m) {
+      cur = m;
+      $("ndi").classList.toggle("wall", !!m.crop);
+      img().onerror = () => setTimeout(() => { if (cur === m) img().src = url(m); }, 2000);
+      img().src = url(m);
+    }
+    function stop() {
+      if (!cur) return;
+      cur = null;
+      img().onerror = null;
+      img().removeAttribute("src");
+    }
+    return { show, stop };
+  })();
+  on("ndi", (m) => {
+    state.gen = m.gen; state.kind = "ndi";
+    showSurface("ndi");
+    ndi.show(m);
+  });
 
   function applyVolume(el, ownMuted) {
     el.volume = Math.max(0, Math.min(1, state.volume / 100));
@@ -376,6 +411,7 @@ const CMX = (() => {
     const f = $("web"); if (f.src && f.src !== "about:blank") f.src = "about:blank";
     if (CMX.template) CMX.template.clear();
     if (CMX.capture) CMX.capture.stopFullscreen();
+    ndi.stop();
   }
   on("web", (m) => {
     state.gen = m.gen; state.kind = "web";
