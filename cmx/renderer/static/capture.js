@@ -28,6 +28,33 @@ CMX.capture = (() => {
     return devs[0] || null;
   }
 
+  // The sound for a camera: its own microphone (a webcam's or a capture card's
+  // audio share the camera's groupId), else the system default; none at all (a
+  // Raspberry Pi has no microphone of its own) means the picture only.
+  async function pickMic(cam) {
+    const mics = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "audioinput");
+    if (!mics.length) return null;
+    return (cam.groupId && mics.find((d) => d.groupId === cam.groupId))
+      || mics.find((d) => d.deviceId === "default") || mics[0];
+  }
+  const micConstraint = (mic) => (mic.deviceId ? { deviceId: { exact: mic.deviceId } } : true);
+
+  // getUserMedia that gives up: a device that never answers would otherwise leave
+  // the tile blank, with no hint and no retry. A stream that arrives late is closed.
+  const OPEN_TIMEOUT_MS = 10000;
+  function openMedia(constraints) {
+    return new Promise((resolve, reject) => {
+      let late = false;
+      const t = setTimeout(() => {
+        late = true;
+        reject(new DOMException(`no answer in ${OPEN_TIMEOUT_MS / 1000} s`, "TimeoutError"));
+      }, OPEN_TIMEOUT_MS);
+      navigator.mediaDevices.getUserMedia(constraints).then(
+        (s) => { clearTimeout(t); if (late) s.getTracks().forEach((x) => x.stop()); else resolve(s); },
+        (e) => { clearTimeout(t); if (!late) reject(e); });
+    });
+  }
+
   // Ask the camera for what the picture covers on screen, at most capture_max_height
   // lines (720 by default, config.yaml): every frame of a USB camera is decoded and
   // drawn by the CPU, and a Raspberry Pi 4 reached 85 °C and throttled decoding 1080p
@@ -70,6 +97,15 @@ CMX.capture = (() => {
     };
     slots.add(slot);
     const say = (text) => { hint.textContent = text || ""; hint.classList.toggle("on", !!text); };
+    // Why the camera isn't showing, in the player log: once per new reason, not
+    // on every 3 s retry ("Waiting for signal…" on screen covers them all).
+    let lastReport = null;
+    const report = (why) => {
+      if (why === lastReport) return;
+      lastReport = why;
+      if (why) CMX.post("error", { what: `capture ${label || id || "(first camera)"}: ${why}` });
+    };
+    const reason = (e) => `${(e && e.name) || "Error"}${e && e.message ? ": " + e.message : ""}`;
 
     function audioPath() {
       if (!audio || !stream || !stream.getAudioTracks().length) return;
@@ -134,11 +170,21 @@ CMX.capture = (() => {
         const dev = await pickDevice(label, id);
         if (!dev) throw new Error("no capture device");
         const size = wantedSize(video);
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { deviceId: { exact: dev.deviceId }, width: { ideal: size.width }, height: { ideal: size.height } },
-          audio: audio ? true : false,
-        });
+        const pic = { width: { ideal: size.width }, height: { ideal: size.height } };
+        if (dev.deviceId) pic.deviceId = { exact: dev.deviceId };
+        const mic = audio ? await pickMic(dev) : null;
+        let soundless = audio && !mic ? "no microphone found" : null;
+        try {
+          stream = await openMedia({ video: pic, audio: mic ? micConstraint(mic) : false });
+        } catch (e) {
+          if (!mic) throw e;
+          // One failed device fails the whole request: try the picture on its own
+          // rather than leave the tile waiting because the sound can't be opened.
+          stream = await openMedia({ video: pic, audio: false });
+          soundless = `microphone failed (${reason(e)})`;
+        }
         if (stopped) { stream.getTracks().forEach((t) => t.stop()); return; }
+        report(soundless ? `showing the picture without sound: ${soundless}` : null);
         video.srcObject = stream;
         audioPath();
         slot.volume();
@@ -149,6 +195,8 @@ CMX.capture = (() => {
         for (const t of stream.getVideoTracks()) t.onended = () => { say("Signal lost — reconnecting…"); retry = setTimeout(open, 3000); };
         reportDevices();
       } catch (e) {
+        if (stopped) return;
+        report(reason(e));
         say(everFrame ? "Signal lost — reconnecting…" : "Waiting for signal…");
         retry = setTimeout(open, 3000);
       }

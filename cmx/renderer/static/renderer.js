@@ -26,7 +26,11 @@ const CMX = (() => {
 
   function post(type, data) {
     const body = JSON.stringify(Object.assign({ type }, data || {}));
+    // The reply is never read, so cancel it: an unread body keeps a shared-memory
+    // handle open in the renderer, and at 2.5 reports a second the page ran out after
+    // about 16 000 of them (1 h 48 min) and froze until the kiosk watchdog relaunched it.
     return fetch("/api/event", { method: "POST", headers: { "Content-Type": "application/json" }, body })
+      .then((r) => { if (r.body) r.body.cancel().catch(() => {}); return r; })
       .catch(() => {});
   }
 
