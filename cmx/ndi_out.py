@@ -23,12 +23,10 @@ import base64
 import io
 import json
 import logging
-import os
 import socket
 import threading
 import time
 from typing import Callable, Optional, Tuple
-from urllib.parse import urlsplit
 
 from . import cdp
 
@@ -134,20 +132,10 @@ class ScreencastSource:
         ws = cdp._page_ws_url(self.port, self.page_prefix, 5)
         if not ws:
             return
-        u = urlsplit(ws)
-        sock = socket.create_connection((u.hostname, u.port or 80), timeout=10)
+        sock = cdp.open_page(ws, 10)
+        if sock is None:
+            return
         try:
-            key = base64.b64encode(os.urandom(16)).decode()
-            sock.sendall((f"GET {u.path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\nUpgrade: websocket\r\n"
-                          f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
-            head = b""
-            while b"\r\n\r\n" not in head:
-                chunk = sock.recv(1024)
-                if not chunk:
-                    return
-                head += chunk
-            if b" 101 " not in head.split(b"\r\n", 1)[0]:
-                return
             cdp._send(sock, json.dumps({"id": 1, "method": "Page.startScreencast", "params": {
                 "format": "jpeg", "quality": 80, "maxWidth": self.max_width, "maxHeight": 2160, "everyNthFrame": 1}}))
             n = 1

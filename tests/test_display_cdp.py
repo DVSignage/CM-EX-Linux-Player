@@ -9,6 +9,8 @@ import struct
 import threading
 import time
 
+import pytest
+
 from cmx import cdp, display
 
 
@@ -93,3 +95,50 @@ def test_capture_without_chromium_is_none():
     t = time.monotonic()
     assert cdp.capture("http://127.0.0.1:8083/", port=port, timeout=1) is None
     assert time.monotonic() - t < 3
+
+
+def _ipv6_loopback() -> bool:
+    try:
+        with socket.socket(socket.AF_INET6) as s:
+            s.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not _ipv6_loopback(), reason="no IPv6 loopback here")
+def test_capture_when_chromium_listens_on_ipv6_loopback_only():
+    # Chromium takes [::1] when 127.0.0.1:9333 is still held as it starts
+    jpeg = b"\xff\xd8\xff\xe0v6jpeg"
+    hosts = []
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self):
+            req = b""
+            while b"\r\n\r\n" not in req:
+                req += self.request.recv(1024)
+            port = self.server.server_address[1]
+            hosts.append([ln for ln in req.split(b"\r\n") if ln.lower().startswith(b"host:")][0])
+            if req.startswith(b"GET /json"):
+                body = json.dumps([{"type": "page", "url": "http://127.0.0.1:8090/",
+                                    "webSocketDebuggerUrl": f"ws://[::1]:{port}/devtools/page/1"}]).encode()
+                self.request.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                                     + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+                return
+            self.request.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            msg = json.loads(cdp._recv_message(self.request))
+            reply = json.dumps({"id": msg["id"], "result": {"data": base64.b64encode(jpeg).decode()}}).encode()
+            self.request.sendall(bytes([0x81, 126]) + struct.pack(">H", len(reply)) + reply)
+
+    class V6Only(FakeDevTools):
+        address_family = socket.AF_INET6
+
+    srv = V6Only(("::1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        assert cdp.capture("http://127.0.0.1:8090/", port=port) == jpeg
+        assert hosts[-1] == f"Host: [::1]:{port}".encode()      # bracketed, a valid Host
+    finally:
+        srv.shutdown()
+        srv.server_close()
