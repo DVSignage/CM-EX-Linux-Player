@@ -20,7 +20,8 @@ StandardError=journal
 Environment="DISPLAY=:0"
 Environment="XAUTHORITY=/home/signage/.Xauthority"
 
-# Security
+# Security. With a snap Chromium (Ubuntu) set this to false: snap-confine is
+# setuid and refuses to start under NoNewPrivileges (install.sh does this itself).
 NoNewPrivileges=true
 PrivateTmp=true
 # the X server's sockets: shared, or the player cannot see the display
