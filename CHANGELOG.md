@@ -5,6 +5,21 @@ All notable changes to the CM:EX Linux Player.
 ## [Unreleased]
 
 ### Fixed
+- The renderer page froze every 1 h 48 min and the kiosk watchdog relaunched
+  Chromium (a few seconds of black screen each time): the page's reports to
+  the player (2.5 a second) never read the reply, and each unread reply kept a
+  shared-memory handle open until the page ran out at about 16 000. The reply
+  is now cancelled.
+- A template's camera tile stayed on "Waiting for signal…" when its sound
+  could not be opened (a camera without a microphone, a Raspberry Pi has none
+  of its own): one failed device fails the whole request. The page now asks
+  for the camera's own microphone (same device group) and shows the picture
+  without sound when there is none or it fails. A camera or microphone that
+  never answers is given up after 10 s instead of leaving the tile blank.
+- Editing a template on the CMS left the replaced or removed camera tile's
+  stream open next to the new one (a second decode of every frame on a Pi).
+- Camera failures reached no log: the page now reports each new reason
+  (`[RENDERER] capture …: NotFoundError …`), once, not on every retry.
 - `install.sh` stopped silently after "Desktop user" on Ubuntu 24.04 (GNOME
   46) when no X11 app had opened yet: Xwayland starts on demand, so the
   display lookup found no Xwayland process and `set -e` ended the install.
