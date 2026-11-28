@@ -5,6 +5,10 @@ All notable changes to the CM:EX Linux Player.
 ## [Unreleased]
 
 ### Fixed
+- CMS previews and NDI output found no page when Chromium's DevTools port
+  came up on `[::1]` only (it does when 127.0.0.1:9333 is still held as it
+  starts, e.g. right after a restart): the client now tries both loopbacks
+  and sends an IPv6 `Host` in brackets.
 - The renderer page froze every 1 h 48 min and the kiosk watchdog relaunched
   Chromium (a few seconds of black screen each time): the page's reports to
   the player (2.5 a second) never read the reply, and each unread reply kept a

@@ -18,14 +18,48 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 PORT = 9333
+# Chromium listens on 127.0.0.1, or on [::1] only when 127.0.0.1:PORT was still
+# taken as it started (seen on a Raspberry Pi after the player restarted Chromium):
+# asking 127.0.0.1 alone then found nothing, and previews and NDI output stopped.
+LOOPBACKS = ("127.0.0.1", "[::1]")
 
 
 def _page_ws_url(port: int, prefix: str, timeout: float) -> Optional[str]:
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=timeout) as r:
-        targets = json.load(r)
-    for t in targets:
-        if t.get("type") == "page" and str(t.get("url", "")).startswith(prefix) and t.get("webSocketDebuggerUrl"):
-            return t["webSocketDebuggerUrl"]
+    error: Optional[OSError] = None
+    for host in LOOPBACKS:
+        try:
+            with urllib.request.urlopen(f"http://{host}:{port}/json", timeout=timeout) as r:
+                targets = json.load(r)
+        except OSError as e:             # refused / no IPv6 here: try the other loopback
+            error = e
+            continue
+        for t in targets:
+            if t.get("type") == "page" and str(t.get("url", "")).startswith(prefix) and t.get("webSocketDebuggerUrl"):
+                return t["webSocketDebuggerUrl"]
+        return None
+    raise error
+
+
+def open_page(ws_url: str, timeout: float) -> Optional[socket.socket]:
+    """A websocket to a page's DevTools endpoint, or None when Chromium refuses it."""
+    u = urlsplit(ws_url)
+    sock = socket.create_connection((u.hostname, u.port or 80), timeout=timeout)
+    try:
+        key = base64.b64encode(os.urandom(16)).decode()
+        # netloc keeps an IPv6 address in brackets ("[::1]:9333"), as Host must
+        sock.sendall((f"GET {u.path} HTTP/1.1\r\nHost: {u.netloc}\r\nUpgrade: websocket\r\n"
+                      f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(1024)
+            if not chunk:
+                break
+            head += chunk
+        if b" 101 " in head.split(b"\r\n", 1)[0]:
+            return sock
+    except OSError:
+        pass
+    sock.close()
     return None
 
 
@@ -83,20 +117,10 @@ def capture(page_prefix: str, port: int = PORT, quality: int = 70, timeout: floa
         ws = _page_ws_url(port, page_prefix, timeout)
         if not ws:
             return None
-        u = urlsplit(ws)
-        sock = socket.create_connection((u.hostname, u.port or 80), timeout=timeout)
+        sock = open_page(ws, timeout)
+        if sock is None:
+            return None
         try:
-            key = base64.b64encode(os.urandom(16)).decode()
-            sock.sendall((f"GET {u.path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\nUpgrade: websocket\r\n"
-                          f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
-            head = b""
-            while b"\r\n\r\n" not in head:
-                chunk = sock.recv(1024)
-                if not chunk:
-                    return None
-                head += chunk
-            if b" 101 " not in head.split(b"\r\n", 1)[0]:
-                return None
             _send(sock, json.dumps({"id": 1, "method": "Page.captureScreenshot",
                                     "params": {"format": "jpeg", "quality": quality}}))
             for _ in range(50):
